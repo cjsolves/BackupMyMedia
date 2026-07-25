@@ -1,0 +1,80 @@
+# =============================================================================
+#  Media Pipeline Manager - Chrisdesktop
+#
+#  Single web dashboard at http://chrisdesktop:8090 showing:
+#   - What's being ripped on Mini PC (ARM)
+#   - What's being transcoded on Chrisdesktop (Tdarr)
+#   - What's stored on NAS (Lossless archive + Plex library)
+#   - Problems needing attention (unclassified, stuck, orphaned)
+#
+#  SETUP REQUIRED BEFORE FIRST START:
+#
+#  1. On Mini PC - create a Windows share:
+#       Right-click C:\BackupOfMedia -> Properties -> Sharing -> Share...
+#       Share name: BackupOfMedia  (accessible as \\MiniPC\BackupOfMedia)
+#       Give Chrisdesktop read/write access
+#
+#  2. On NAS - ensure these shares exist and Chrisdesktop has read/write:
+#       \\NAS\Lossless   (uncompressed MKV archive - permanent storage)
+#       \\NAS\Plex       (H.265 transcoded - Plex media library)
+#
+#  3. Edit the environment variables below to match your actual hostnames/paths
+#
+#  4. docker compose up -d
+#     Dashboard: http://localhost:8090
+# =============================================================================
+
+services:
+  pipeline:
+    build: .
+    container_name: media-pipeline
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    environment:
+      # -----------------------------------------------------------------------
+      # Machine hostnames/IPs
+      # -----------------------------------------------------------------------
+      ARM_URL: "http://MiniPC:8080"          # ARM web UI on the ripping Mini PC
+      TDARR_URL: "http://localhost:8266"      # Tdarr on this machine (Chrisdesktop)
+
+      # -----------------------------------------------------------------------
+      # File paths as seen INSIDE the container (mapped via volumes below)
+      # -----------------------------------------------------------------------
+      PATH_MINIPC_COMPLETED: "/media/minipc/completed"
+      PATH_MINIPC_MUSIC:     "/media/minipc/music"
+      PATH_NAS_LOSSLESS:     "/media/nas/Lossless"
+      PATH_NAS_PLEX:         "/media/nas/Plex"
+
+      # -----------------------------------------------------------------------
+      # Tdarr library IDs for the Movies and TV libraries
+      # Find these in the Tdarr UI -> Libraries tab -> click a library -> URL shows the ID
+      # Leave blank if you want the pipeline to discover them automatically
+      # -----------------------------------------------------------------------
+      TDARR_LIBRARY_MOVIES: ""
+      TDARR_LIBRARY_TV: ""
+
+      # -----------------------------------------------------------------------
+      # How long (minutes) a job can stay in the same state before flagged STUCK
+      # -----------------------------------------------------------------------
+      STUCK_THRESHOLD_RIPPING: "180"     # 3 hours
+      STUCK_THRESHOLD_MOVING: "30"       # 30 min
+      STUCK_THRESHOLD_TRANSCODING: "240" # 4 hours
+
+    volumes:
+      # Pipeline database (persists across restarts)
+      - pipeline_db:/data
+
+      # Mini PC share - map \\MiniPC\BackupOfMedia to /media/minipc
+      # On Windows Docker Desktop, UNC paths work like this:
+      - "//MiniPC/BackupOfMedia:/media/minipc"
+
+      # NAS shares
+      - "//NAS/Lossless:/media/nas/Lossless"
+      - "//NAS/Plex:/media/nas/Plex"
+
+    # Tdarr is on the same machine - use host network so localhost:8266 works
+    network_mode: host
+
+volumes:
+  pipeline_db:

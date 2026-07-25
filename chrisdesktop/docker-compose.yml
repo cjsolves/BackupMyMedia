@@ -1,0 +1,141 @@
+# =============================================================================
+#  Chrisdesktop - Media Transcoding Stack
+#
+#  Services:
+#    1. media-organizer  Sorts incoming lossless files from Robocopy into
+#                        organised Lossless/ library by type (Movie/TV/Music)
+#    2. tdarr            Watches Lossless/ and transcodes MKV to H.265 for Plex
+#
+#  FOLDER LAYOUT (create these on D:\ before first start):
+#    D:\PlexMedia\
+#      Inbox\            <-- Robocopy drops files here from local ripping machine
+#        completed\          (ARM video rips: Movie Title (Year)\ and Show\Season XX\)
+#        music\              (ARM music rips: Artist\Album\*.flac)
+#      Lossless\         <-- Permanent lossless archive (NEVER DELETED)
+#        Movies\
+#        TV\
+#        Music\          <-- Also used as Plex Music library (no transcoding needed)
+#      Plex\             <-- H.265 transcoded output (Plex video libraries)
+#        Movies\
+#        TV\
+#      Transcode-Temp\   <-- Tdarr scratch space (use a fast SSD if available)
+#
+#  PREREQUISITES:
+#    - NVIDIA driver (latest Game Ready or Studio driver)
+#    - NVIDIA Container Toolkit for Docker Desktop (WSL2):
+#        https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#    - Docker Desktop with WSL2 backend
+#    - Create the folder structure above
+#
+#  START:  docker compose up -d
+#  TDARR UI: http://localhost:8265   (configure libraries - see comments below)
+#
+#  PLEX LIBRARIES (point Plex at these paths):
+#    Movies:  D:\PlexMedia\Plex\Movies
+#    TV:      D:\PlexMedia\Plex\TV
+#    Music:   D:\PlexMedia\Lossless\Music   (FLAC served directly, no transcode)
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  #  media-organizer
+  #  Watches Inbox/ for new directories dropped by Robocopy.
+  #  Waits until files are fully copied (60s stability check), then classifies:
+  #    - Folder contains 'Season XX' subdir  -->  Lossless/TV/
+  #    - No Season subdirs                   -->  Lossless/Movies/
+  #    - Music inbox                         -->  Lossless/Music/
+  # ---------------------------------------------------------------------------
+  media-organizer:
+    build: ./media-organizer
+    container_name: media-organizer
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/London
+      - INBOX_COMPLETED=/media/inbox/completed
+      - INBOX_MUSIC=/media/inbox/music
+      - LOSSLESS_MOVIES=/media/lossless/Movies
+      - LOSSLESS_TV=/media/lossless/TV
+      - LOSSLESS_MUSIC=/media/lossless/Music
+      # Seconds without any file-size change before a folder is moved
+      - STABILITY_SECONDS=60
+      - POLL_INTERVAL=10
+    volumes:
+      - "D:/PlexMedia/Inbox:/media/inbox"
+      - "D:/PlexMedia/Lossless:/media/lossless"
+
+  # ---------------------------------------------------------------------------
+  #  tdarr
+  #  Automated transcoding: Lossless/ MKV --> H.265 MKV --> Plex/
+  #  Keeps lossless audio tracks (DTS-HD MA, TrueHD) intact via copy passthrough.
+  #
+  #  AFTER FIRST START - configure via http://localhost:8265:
+  #
+  #  Libraries tab -> + Add Library:
+  #
+  #    Library "Movies"
+  #      Source folder:  /media/lossless/Movies
+  #      Output folder:  /media/plex/Movies       (enable "Output to separate folder")
+  #      Transcode plugin (FFmpeg custom args):
+  #        NVIDIA GPU:   -c:v hevc_nvenc -preset p4 -cq 18 -c:a copy -c:s copy
+  #        CPU fallback: -c:v libx265 -crf 18 -preset medium -c:a copy -c:s copy
+  #
+  #    Library "TV"
+  #      Source folder:  /media/lossless/TV
+  #      Output folder:  /media/plex/TV
+  #      (same plugin stack as Movies)
+  #
+  #  Workers tab:
+  #    GPU Transcode workers: 2   (adjust based on your GPU; 1 is safe to start)
+  #    CPU Transcode workers: 0   (or 1 for CPU fallback when GPU is busy)
+  #
+  #  NOTE: Music (FLAC) is already lossless and Plex plays it natively.
+  #        Do NOT add a Tdarr library for Music.
+  # ---------------------------------------------------------------------------
+  tdarr:
+    image: haveagitgat/tdarr:latest
+    container_name: tdarr
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/London
+      - PUID=1000
+      - PGID=1000
+      - UMASK_SET=002
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265
+      # internalNode=true: this container acts as both server AND transcode worker
+      - internalNode=true
+      - inContainer=true
+      - ffmpegVersion=7
+      - nodeName=ChrisdesktopNode
+      # NVIDIA GPU passthrough
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    ports:
+      - "8265:8265"   # Tdarr Web UI
+      - "8266:8266"   # Tdarr Server (nodes connect here)
+    volumes:
+      - tdarr_server:/app/server
+      - tdarr_configs:/app/configs
+      - tdarr_logs:/app/logs
+      # Input: organised lossless library
+      - "D:/PlexMedia/Lossless:/media/lossless"
+      # Output: Plex-ready H.265 library
+      - "D:/PlexMedia/Plex:/media/plex"
+      # Scratch space for in-progress transcodes (use a fast SSD)
+      - "D:/PlexMedia/Transcode-Temp:/temp"
+    # NVIDIA GPU access via Docker Desktop WSL2
+    # Remove this 'deploy' block entirely if you have no NVIDIA GPU (CPU-only mode)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+
+volumes:
+  tdarr_server:
+  tdarr_configs:
+  tdarr_logs:

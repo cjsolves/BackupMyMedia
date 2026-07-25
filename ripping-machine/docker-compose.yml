@@ -1,0 +1,65 @@
+# =============================================================================
+#  ARM - Automatic Ripping Machine
+#  Local machine with USB DVD + Blu-ray drives
+#
+#  BEFORE STARTING:
+#   1. Run ..\setup-usb-drives.ps1 (as Administrator) to attach USB drives to WSL2
+#   2. Create the required directories (first-run only):
+#        mkdir C:\BackupOfMedia\arm-home C:\BackupOfMedia\media
+#        mkdir C:\BackupOfMedia\music    C:\BackupOfMedia\arm-logs
+#        mkdir C:\BackupOfMedia\arm-config
+#   3. Copy arm.yaml and abcde.conf from .\config\ into C:\BackupOfMedia\arm-config\
+#      (ARM will auto-generate defaults if absent, but our tuned config is recommended)
+#   4. docker compose up -d
+#
+#  WEB UI: http://localhost:8080
+#  Default login: admin / password   <-- CHANGE AFTER FIRST LOGIN
+#
+#  OUTPUT:
+#   Lossless MKV  -->  C:\BackupOfMedia\media\completed\<Title (Year)>\*.mkv
+#   FLAC Music    -->  C:\BackupOfMedia\music\<Artist>\<Album>\*.flac
+# =============================================================================
+
+services:
+  arm:
+    image: automaticrippingmachine/automatic-ripping-machine:latest
+    container_name: arm-rippers
+    restart: unless-stopped
+
+    # Required for udev disc-insertion detection and raw device access
+    privileged: true
+
+    ports:
+      - "8080:8080"
+
+    environment:
+      # ARM_UID/GID deliberately omitted: ARM defaults to uid/gid 1000 (arm user).
+      # Named Docker volumes (arm_home, arm_config) are created inside Docker's Linux
+      # filesystem and ARE correctly owned by the arm user, so the startup check passes.
+      # The output bind-mounts (media/music/logs) get 0777 permissions from Docker
+      # Desktop on Windows, so the arm user can write to them without owning them.
+      - TZ=Europe/London
+
+    volumes:
+      # Named volumes: ARM owns these (database, HandBrake settings, config files).
+      # Docker initialises these as the arm user inside a Linux filesystem.
+      - arm_home:/home/arm
+      - arm_config:/etc/arm/config
+
+      # Bind mounts for OUTPUT only - these land on your Windows filesystem.
+      # Docker Desktop exposes Windows paths with 0777 permissions, so arm can write.
+      - "C:/BackupOfMedia/media:/home/arm/media"      # lossless MKV output
+      - "C:/BackupOfMedia/music:/home/arm/music"       # FLAC music output
+      - "C:/BackupOfMedia/arm-logs:/home/arm/logs"     # log files
+
+    # USB optical drives - all three attached via setup-usb-drives.ps1 (run as Admin after each reboot).
+    # Verify paths with: wsl -d docker-desktop ls /dev/sr*
+    # Drive order (/dev/sr0, sr1, sr2) depends on usbipd attach order; ARM handles all automatically.
+    devices:
+      - "/dev/sr0:/dev/sr0"   # Drive 1 (OPTIARC DVD RW AD-5670S)
+      - "/dev/sr1:/dev/sr1"   # Drive 2 (HL-DT-ST BD-RE BU40N - LG Blu-ray)
+      - "/dev/sr2:/dev/sr2"   # Drive 3 (DVD RW USB Device)
+
+volumes:
+  arm_home:    # ARM database, HandBrake/MakeMKV settings (managed by Docker)
+  arm_config:  # arm.yaml, abcde.conf (managed by Docker; seeded below after first start)

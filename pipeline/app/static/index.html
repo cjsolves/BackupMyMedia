@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Media Pipeline</title>
+<style>
+  :root {
+    --bg: #0f1117; --surface: #1a1d27; --surface2: #22263a;
+    --border: #2d3148; --text: #e4e6f0; --muted: #7880a0;
+    --blue: #4f8ef7; --orange: #f0934a; --green: #4cba6f;
+    --red: #e0534a; --purple: #9b78f0; --yellow: #f0c84a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+         background: var(--bg); color: var(--text); font-size: 14px; }
+
+  /* ---- Header ---- */
+  header { background: var(--surface); border-bottom: 1px solid var(--border);
+           padding: 12px 20px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 18px; font-weight: 600; letter-spacing: -0.3px; }
+  .pulse { width: 8px; height: 8px; border-radius: 50%; background: var(--green);
+           animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  .header-right { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+  .ts { color: var(--muted); font-size: 12px; }
+  button.refresh { background: var(--surface2); border: 1px solid var(--border);
+                   color: var(--text); padding: 5px 12px; border-radius: 6px;
+                   cursor: pointer; font-size: 13px; }
+  button.refresh:hover { background: var(--border); }
+
+  /* ---- Summary cards ---- */
+  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px,1fr));
+             gap: 12px; padding: 16px 20px; }
+  .card { background: var(--surface); border: 1px solid var(--border);
+          border-radius: 10px; padding: 14px 16px; }
+  .card .num { font-size: 32px; font-weight: 700; line-height: 1; }
+  .card .label { color: var(--muted); font-size: 12px; margin-top: 4px; text-transform: uppercase; letter-spacing: .5px; }
+  .card.blue .num  { color: var(--blue); }
+  .card.orange .num{ color: var(--orange); }
+  .card.purple .num{ color: var(--purple); }
+  .card.green .num { color: var(--green); }
+  .card.red .num   { color: var(--red); }
+
+  /* ---- Nav tabs ---- */
+  nav { display: flex; gap: 0; padding: 0 20px; border-bottom: 1px solid var(--border); }
+  nav button { background: none; border: none; color: var(--muted); padding: 10px 16px;
+               cursor: pointer; font-size: 14px; border-bottom: 2px solid transparent;
+               transition: all .15s; }
+  nav button.active { color: var(--text); border-bottom-color: var(--blue); }
+  nav button:hover { color: var(--text); }
+  .badge { background: var(--red); color: #fff; border-radius: 10px;
+           padding: 1px 6px; font-size: 11px; margin-left: 5px; }
+
+  /* ---- Main content ---- */
+  main { padding: 16px 20px; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+
+  /* ---- Pipeline view ---- */
+  .pipeline-stages { display: flex; gap: 12px; overflow-x: auto; padding-bottom: 8px; }
+  .stage-col { min-width: 240px; flex: 1; }
+  .stage-title { font-size: 11px; text-transform: uppercase; letter-spacing: .6px;
+                 color: var(--muted); margin-bottom: 8px; display: flex;
+                 align-items: center; gap: 6px; }
+  .stage-title .dot { width: 8px; height: 8px; border-radius: 50%; }
+
+  /* ---- Item cards ---- */
+  .item-card { background: var(--surface); border: 1px solid var(--border);
+               border-radius: 8px; padding: 12px; margin-bottom: 8px; }
+  .item-card.problem { border-color: var(--red); }
+  .item-title { font-weight: 600; font-size: 13px; margin-bottom: 4px;
+                white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .item-meta { color: var(--muted); font-size: 11px; display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { background: var(--surface2); border-radius: 4px; padding: 2px 7px; font-size: 11px; }
+  .chip.movie  { color: var(--blue); }
+  .chip.tv     { color: var(--purple); }
+  .chip.music  { color: var(--green); }
+  .chip.dvd    { color: var(--muted); }
+  .chip.bluray { color: var(--orange); }
+  .size { color: var(--muted); font-size: 11px; }
+
+  /* ---- Problem panel ---- */
+  .problem-card { background: var(--surface); border: 1px solid var(--red);
+                  border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }
+  .problem-header { display: flex; align-items: flex-start; gap: 10px; }
+  .problem-icon { font-size: 20px; }
+  .problem-title { font-weight: 600; font-size: 14px; }
+  .problem-code { color: var(--red); font-size: 11px; font-family: monospace;
+                  background: rgba(224,83,74,.1); padding: 2px 6px; border-radius: 4px; }
+  .problem-detail { color: var(--muted); font-size: 12px; margin: 6px 0 10px; line-height: 1.5; }
+  .problem-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .btn { border: none; border-radius: 6px; padding: 6px 14px; font-size: 13px;
+         cursor: pointer; font-weight: 500; transition: opacity .15s; }
+  .btn:hover { opacity: .85; }
+  .btn-primary  { background: var(--blue); color: #fff; }
+  .btn-danger   { background: var(--red); color: #fff; }
+  .btn-secondary{ background: var(--surface2); border: 1px solid var(--border); color: var(--text); }
+
+  /* ---- Reclassify form ---- */
+  .reclassify-form { display: none; margin-top: 12px; background: var(--surface2);
+                     border-radius: 8px; padding: 12px; }
+  .reclassify-form.open { display: block; }
+  .reclassify-form label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; margin-top: 8px; }
+  .reclassify-form input, .reclassify-form select {
+    width: 100%; background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); border-radius: 5px; padding: 6px 10px; font-size: 13px; }
+  .reclassify-form .form-row { display: grid; grid-template-columns: 1fr 100px 120px; gap: 8px; align-items: end; }
+
+  /* ---- Status indicator ---- */
+  .machine-status { display: flex; gap: 16px; margin-bottom: 14px; }
+  .machine-pill { background: var(--surface); border: 1px solid var(--border);
+                  border-radius: 20px; padding: 6px 14px; font-size: 12px;
+                  display: flex; align-items: center; gap: 6px; }
+  .machine-pill .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .dot-green { background: var(--green); }
+  .dot-red   { background: var(--red); }
+  .dot-orange{ background: var(--orange); }
+
+  /* ---- Event log ---- */
+  .event-log { font-family: monospace; font-size: 12px; color: var(--muted);
+               background: var(--surface); border: 1px solid var(--border);
+               border-radius: 8px; padding: 12px; max-height: 300px; overflow-y: auto; }
+  .event-log .ev { padding: 2px 0; border-bottom: 1px solid var(--border); }
+  .event-log .ev:last-child { border: none; }
+  .ev-ts { color: var(--border); margin-right: 8px; }
+  .ev-item { color: var(--blue); margin-right: 6px; }
+  .ev-state { color: var(--green); }
+  .ev-problem { color: var(--red); }
+
+  /* ---- Spinner ---- */
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border);
+             border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---- NAS storage bars ---- */
+  .progress-bar { height: 4px; background: var(--surface2); border-radius: 2px; margin-top: 6px; }
+  .progress-fill { height: 100%; border-radius: 2px; background: var(--green); transition: width .3s; }
+
+  /* ---- Empty state ---- */
+  .empty { text-align: center; padding: 40px; color: var(--muted); }
+  .empty .big { font-size: 40px; margin-bottom: 10px; }
+
+  @media (max-width: 700px) {
+    .pipeline-stages { flex-direction: column; }
+    .stage-col { min-width: unset; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="pulse" id="connDot"></div>
+  <h1>🎬 Media Pipeline</h1>
+  <div class="header-right">
+    <span class="ts" id="lastUpdate">—</span>
+    <button class="refresh" onclick="refresh()">↻ Refresh now</button>
+  </div>
+</header>
+
+<div class="summary" id="summary">
+  <div class="card blue">  <div class="num" id="c-ripping">—</div><div class="label">Ripping</div></div>
+  <div class="card orange"><div class="num" id="c-moving">—</div><div class="label">Moving</div></div>
+  <div class="card purple"><div class="num" id="c-transcoding">—</div><div class="label">Transcoding</div></div>
+  <div class="card green"> <div class="num" id="c-complete">—</div><div class="label">Complete</div></div>
+  <div class="card red">   <div class="num" id="c-problems">—</div><div class="label">Problems</div></div>
+</div>
+
+<nav>
+  <button class="active" onclick="showTab('pipeline')">Pipeline</button>
+  <button onclick="showTab('problems')">Problems <span class="badge" id="badge-problems" style="display:none">0</span></button>
+  <button onclick="showTab('complete')">On NAS</button>
+  <button onclick="showTab('log')">Activity Log</button>
+</nav>
+
+<main>
+
+  <!-- Pipeline tab -->
+  <div class="tab-panel active" id="tab-pipeline">
+    <div class="machine-status" id="machineStatus"></div>
+    <div class="pipeline-stages" id="stages"></div>
+  </div>
+
+  <!-- Problems tab -->
+  <div class="tab-panel" id="tab-problems">
+    <div id="problemList">
+      <div class="empty"><div class="big">✅</div>No problems detected</div>
+    </div>
+  </div>
+
+  <!-- Complete/NAS tab -->
+  <div class="tab-panel" id="tab-complete">
+    <div id="completeList"></div>
+  </div>
+
+  <!-- Log tab -->
+  <div class="tab-panel" id="tab-log">
+    <div class="event-log" id="eventLog"><div class="empty">No events yet</div></div>
+  </div>
+
+</main>
+
+<script>
+// ---- State ----
+let data = null;
+let evtSource = null;
+const STAGE_ORDER = ['ripping','rip_complete','moving_to_nas','on_nas_lossless','queued_transcode','transcoding','complete'];
+const STAGE_LABELS = {
+  ripping:          {label:'Ripping',          color:'var(--blue)',   dot:'#4f8ef7'},
+  rip_complete:     {label:'Rip Complete',      color:'var(--orange)', dot:'#f0934a'},
+  moving_to_nas:    {label:'Moving to NAS',     color:'var(--orange)', dot:'#f0c84a'},
+  on_nas_lossless:  {label:'On NAS (Lossless)', color:'var(--purple)', dot:'#9b78f0'},
+  queued_transcode: {label:'Transcode Queue',   color:'var(--purple)', dot:'#9b78f0'},
+  transcoding:      {label:'Transcoding',       color:'var(--orange)', dot:'#f0934a'},
+  complete:         {label:'Complete',          color:'var(--green)',  dot:'#4cba6f'},
+  problem:          {label:'Problem',           color:'var(--red)',    dot:'#e0534a'},
+};
+const PROBLEM_ICONS = {
+  unclassified: '❓', stuck_ripping: '🔄', stuck_transcoding: '⏳',
+  move_failed: '📦', transcode_failed: '⚠️', orphan_minipc: '👻',
+  orphan_nas: '👻', nas_unreachable: '🔌', default: '⚠️'
+};
+
+// ---- SSE ----
+function connectSSE() {
+  if (evtSource) evtSource.close();
+  evtSource = new EventSource('/api/stream');
+  evtSource.addEventListener('init',   e => { data = JSON.parse(e.data); render(); });
+  evtSource.addEventListener('update', e => { fetchAndRender(); });
+  evtSource.onerror = () => {
+    document.getElementById('connDot').style.background = 'var(--red)';
+    setTimeout(connectSSE, 5000);
+  };
+  evtSource.onopen = () => {
+    document.getElementById('connDot').style.background = 'var(--green)';
+  };
+}
+
+async function fetchAndRender() {
+  const r = await fetch('/api/summary');
+  data = await r.json();
+  render();
+}
+
+async function refresh() {
+  await fetch('/api/refresh', {method:'POST'});
+  setTimeout(fetchAndRender, 2000);
+}
+
+// ---- Rendering ----
+function render() {
+  if (!data) return;
+  renderSummary();
+  renderMachineStatus();
+  renderPipeline();
+  renderProblems();
+  renderComplete();
+  renderLog();
+  document.getElementById('lastUpdate').textContent = new Date(data.ts).toLocaleTimeString();
+}
+
+function renderSummary() {
+  const c = data.counts || {};
+  const ripping = (c.ripping||0);
+  const moving  = (c.rip_complete||0) + (c.moving_to_nas||0);
+  const trans   = (c.on_nas_lossless||0) + (c.queued_transcode||0) + (c.transcoding||0);
+  const done    = c.complete||0;
+  const probs   = c.problem||0;
+  document.getElementById('c-ripping').textContent = ripping;
+  document.getElementById('c-moving').textContent  = moving;
+  document.getElementById('c-transcoding').textContent = trans;
+  document.getElementById('c-complete').textContent = done;
+  document.getElementById('c-problems').textContent = probs;
+
+  const badge = document.getElementById('badge-problems');
+  badge.style.display = probs > 0 ? '' : 'none';
+  badge.textContent = probs;
+}
+
+function renderMachineStatus() {
+  const s = document.getElementById('machineStatus');
+  const armOk = (data.counts?.ripping || 0) >= 0; // reachable if we got data
+  const nasOk = data.nas_reachable;
+  s.innerHTML = `
+    <div class="machine-pill"><span class="dot ${armOk?'dot-green':'dot-red'}"></span>Mini PC (ARM) <a href="${data.arm_url}" target="_blank" style="color:var(--blue);text-decoration:none;margin-left:4px">↗</a></div>
+    <div class="machine-pill"><span class="dot dot-green"></span>Chrisdesktop (Tdarr) <a href="http://localhost:8265" target="_blank" style="color:var(--blue);text-decoration:none;margin-left:4px">↗</a></div>
+    <div class="machine-pill"><span class="dot ${nasOk?'dot-green':'dot-red'}"></span>NAS ${nasOk?'reachable':'UNREACHABLE'}</div>
+  `;
+}
+
+function renderPipeline() {
+  const items = (data.items||[]).filter(i => i.state !== 'complete');
+  const byState = {};
+  for (const st of STAGE_ORDER.filter(s=>s!=='complete')) byState[st] = [];
+  for (const item of items) {
+    if (!byState[item.state]) byState[item.state] = [];
+    byState[item.state].push(item);
+  }
+
+  const el = document.getElementById('stages');
+  if (items.length === 0) {
+    el.innerHTML = '<div class="empty" style="flex:1"><div class="big">🎬</div>No items in pipeline — insert a disc to begin</div>';
+    return;
+  }
+  el.innerHTML = STAGE_ORDER.filter(s=>s!=='complete').map(state => {
+    const cfg = STAGE_LABELS[state];
+    const stateItems = byState[state] || [];
+    if (stateItems.length === 0 && !['ripping','on_nas_lossless','transcoding'].includes(state)) return '';
+    return `
+      <div class="stage-col">
+        <div class="stage-title">
+          <span class="dot" style="background:${cfg.dot}"></span>
+          ${cfg.label}
+          <span style="color:var(--text);margin-left:auto">${stateItems.length > 0 ? stateItems.length : ''}</span>
+        </div>
+        ${stateItems.length === 0
+          ? `<div style="color:var(--border);font-size:12px;padding:8px">Empty</div>`
+          : stateItems.map(itemCard).join('')}
+      </div>`;
+  }).filter(Boolean).join('');
+}
+
+function itemCard(item) {
+  const mc = {movie:'movie',tv:'tv',music:'music'}[item.media_type] || '';
+  const dc = {dvd:'dvd',bluray:'bluray'}[item.disctype] || item.disctype || '';
+  const size = item.size_bytes > 0 ? fmtSize(item.size_bytes) : '';
+  const spinner = ['moving_to_nas','transcoding'].includes(item.state) ? '<span class="spinner"></span>' : '';
+  return `
+    <div class="item-card ${item.state==='problem'?'problem':''}">
+      <div class="item-title" title="${item.id}">${item.title||item.id} ${item.year?`(${item.year})`:''} ${spinner}</div>
+      <div class="item-meta">
+        ${mc ? `<span class="chip ${mc}">${mc}</span>` : ''}
+        ${dc ? `<span class="chip ${dc}">${dc}</span>` : ''}
+        ${size ? `<span class="size">${size}</span>` : ''}
+      </div>
+    </div>`;
+}
+
+function renderProblems() {
+  const problems = (data.problems || []);
+  const el = document.getElementById('problemList');
+  if (problems.length === 0) {
+    el.innerHTML = '<div class="empty"><div class="big">✅</div>No problems detected</div>';
+    return;
+  }
+  el.innerHTML = problems.map(item => {
+    const icon = PROBLEM_ICONS[item.problem] || PROBLEM_ICONS.default;
+    const isUnclassified = item.problem === 'unclassified';
+    const isOrphan = item.problem?.startsWith('orphan');
+    return `
+      <div class="problem-card" id="prob-${CSS.escape(item.id)}">
+        <div class="problem-header">
+          <span class="problem-icon">${icon}</span>
+          <div style="flex:1">
+            <div class="problem-title">${item.title || item.id} ${item.year?`(${item.year})`:''}</div>
+            <span class="problem-code">${item.problem}</span>
+          </div>
+        </div>
+        <div class="problem-detail">${item.problem_detail || ''}</div>
+        <div class="problem-actions">
+          ${isUnclassified ? `<button class="btn btn-primary" onclick="toggleReclassify('${esc(item.id)}')">✏️ Set Title</button>` : ''}
+          ${isOrphan ? `<button class="btn btn-danger" onclick="deleteOrphan('${esc(item.id)}')">🗑 Delete Files</button>` : ''}
+          ${!isUnclassified && !isOrphan ? `<button class="btn btn-secondary" onclick="retryItem('${esc(item.id)}')">↩ Retry</button>` : ''}
+          <button class="btn btn-secondary" onclick="removeTracking('${esc(item.id)}')">✕ Stop tracking</button>
+        </div>
+        ${isUnclassified ? reclassifyForm(item) : ''}
+      </div>`;
+  }).join('');
+}
+
+function reclassifyForm(item) {
+  return `
+    <div class="reclassify-form" id="form-${CSS.escape(item.id)}">
+      <div style="font-size:13px;margin-bottom:8px;color:var(--muted)">
+        ARM identified disc as: <strong style="color:var(--text)">${item.id}</strong><br>
+        Correct the details below then click Save. ARM will use this for future identification.
+      </div>
+      <div class="form-row">
+        <div>
+          <label>Title</label>
+          <input id="rc-title-${CSS.escape(item.id)}" value="${item.title||''}" placeholder="e.g. The Dark Knight">
+        </div>
+        <div>
+          <label>Year</label>
+          <input id="rc-year-${CSS.escape(item.id)}" value="${item.year||''}" placeholder="2008">
+        </div>
+        <div>
+          <label>Type</label>
+          <select id="rc-type-${CSS.escape(item.id)}">
+            <option value="movie" ${item.media_type==='movie'?'selected':''}>Movie</option>
+            <option value="tv"    ${item.media_type==='tv'?'selected':''}>TV Series</option>
+            <option value="music" ${item.media_type==='music'?'selected':''}>Music</option>
+          </select>
+        </div>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:8px">
+        <button class="btn btn-primary" onclick="saveReclassify('${esc(item.id)}')">💾 Save &amp; Queue</button>
+        <button class="btn btn-secondary" onclick="toggleReclassify('${esc(item.id)}')">Cancel</button>
+      </div>
+    </div>`;
+}
+
+function renderComplete() {
+  const items = (data.items||[]).filter(i => i.state === 'complete');
+  const el = document.getElementById('completeList');
+  if (items.length === 0) {
+    el.innerHTML = '<div class="empty"><div class="big">📦</div>Nothing archived to NAS yet</div>';
+    return;
+  }
+  const byType = {movie:[], tv:[], music:[]};
+  for (const i of items) {
+    const t = i.media_type || 'movie';
+    if (!byType[t]) byType[t] = [];
+    byType[t].push(i);
+  }
+  let html = '';
+  for (const [type, list] of Object.entries(byType)) {
+    if (!list.length) continue;
+    html += `<div style="margin-bottom:20px">
+      <div style="font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:8px">${type}s (${list.length})</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:8px">
+        ${list.map(i => `
+          <div class="item-card">
+            <div class="item-title">${i.title} ${i.year?`(${i.year})`:''}</div>
+            <div class="item-meta">
+              ${i.size_bytes > 0 ? `<span class="size">${fmtSize(i.size_bytes)}</span>` : ''}
+              <span style="color:var(--green);font-size:11px">✓ Lossless</span>
+              ${i.nas_plex_path ? `<span style="color:var(--blue);font-size:11px">✓ Plex</span>` : ''}
+            </div>
+          </div>`).join('')}
+      </div>
+    </div>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderLog() {
+  const events = data.events || [];
+  const el = document.getElementById('eventLog');
+  if (!events.length) { el.innerHTML = '<div class="empty">No events yet</div>'; return; }
+  el.innerHTML = events.map(ev => {
+    const isProblem = ev.event?.startsWith('problem');
+    return `<div class="ev">
+      <span class="ev-ts">${ev.ts?.substring(11,19)||''}</span>
+      <span class="ev-item">${ev.title||ev.item_id}</span>
+      <span class="${isProblem?'ev-problem':'ev-state'}">${ev.event}</span>
+      ${ev.detail ? `<span style="color:var(--muted)"> — ${ev.detail}</span>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ---- Actions ----
+function toggleReclassify(id) {
+  const f = document.getElementById('form-' + CSS.escape(id));
+  if (f) f.classList.toggle('open');
+}
+
+async function saveReclassify(id) {
+  const title = document.getElementById('rc-title-' + CSS.escape(id))?.value?.trim();
+  const year  = document.getElementById('rc-year-'  + CSS.escape(id))?.value?.trim();
+  const type  = document.getElementById('rc-type-'  + CSS.escape(id))?.value;
+  if (!title) { alert('Please enter a title'); return; }
+  const r = await fetch(`/api/items/${encodeURIComponent(id)}/reclassify`, {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({title, year, media_type: type}),
+  });
+  if (r.ok) { fetchAndRender(); showTab('pipeline'); }
+  else alert('Failed: ' + await r.text());
+}
+
+async function retryItem(id) {
+  await fetch(`/api/items/${encodeURIComponent(id)}/retry`, {method:'POST'});
+  fetchAndRender();
+}
+
+async function deleteOrphan(id) {
+  if (!confirm(`Delete orphaned files for "${id}"? This cannot be undone.`)) return;
+  const r = await fetch(`/api/items/${encodeURIComponent(id)}/delete_orphan`, {method:'POST'});
+  if (r.ok) fetchAndRender();
+  else alert('Failed: ' + await r.text());
+}
+
+async function removeTracking(id) {
+  if (!confirm(`Remove "${id}" from tracking? (Files will NOT be deleted)`)) return;
+  await fetch(`/api/items/${encodeURIComponent(id)}`, {method:'DELETE'});
+  fetchAndRender();
+}
+
+// ---- Tabs ----
+function showTab(name) {
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  [...document.querySelectorAll('nav button')].find(b => b.textContent.trim().startsWith(cap(name)))?.classList.add('active');
+}
+
+// ---- Helpers ----
+function fmtSize(b) {
+  if (b > 1e9) return (b/1e9).toFixed(1) + ' GB';
+  if (b > 1e6) return (b/1e6).toFixed(0) + ' MB';
+  return b + ' B';
+}
+function esc(s) { return s.replace(/'/g, "\\'"); }
+function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+
+// ---- Init ----
+connectSSE();
+</script>
+</body>
+</html>

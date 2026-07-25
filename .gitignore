@@ -1,0 +1,47 @@
+# BackupMyMedia
+
+# ===== Secrets & keys (never commit these) =====
+.env
+*.env.local
+# arm.yaml contains OMDB + MakeMKV keys — use arm.yaml.example as template
+ripping-machine/config/arm.yaml
+
+# Docker TLS certificates (for TCP daemon exposure if used)
+certs/
+*.pem
+*.key
+*.crt
+ca.srl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Node / build outputs
+node_modules/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+sync.log
+robocopy.log
+
+# Pipeline database (runtime state, not source-controlled)
+pipeline/data/
+
+# WSL2 kernel artifacts (large build outputs)
+wsl2-kernel/
+*.bak
+
+# VS Code
+.vscode/
