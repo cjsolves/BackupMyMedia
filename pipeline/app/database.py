@@ -39,10 +39,13 @@ STATES = [
     "rip_complete",      # on Mini PC, waiting to move
     "moving_to_nas",     # being copied to NAS
     "on_nas_lossless",   # NAS Lossless folder (archive)
+    "queued_upscale",    # < 1080p — waiting for AI upscaler (lowest priority)
+    "upscaling",         # Real-ESRGAN is processing
     "queued_transcode",  # waiting in Tdarr queue
     "transcoding",       # Tdarr is processing
     "complete",          # both NAS Lossless + NAS Plex populated
     "problem",           # needs human attention
+    "upscale_failed",    # upscaler encountered an error
 ]
 
 PROBLEM_CODES = {

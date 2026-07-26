@@ -48,6 +48,7 @@ async def _run_poll():
     await poller.scan_nas()
     await engine.detect_stuck_jobs()
     await engine.move_rip_complete_items()
+    await engine.check_all_for_upscale()   # queue SD content for AI upscaling
     await broadcast("update", {"ts": datetime.now(timezone.utc).isoformat()})
 
 
@@ -186,6 +187,51 @@ async def api_delete_item(item_id: str):
         await conn.execute("DELETE FROM events WHERE item_id=?", (item_id,))
         await conn.commit()
     await broadcast("update", {"reason": "delete", "item_id": item_id})
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Upscaler API - called by the upscaler Docker service
+# ---------------------------------------------------------------------------
+
+class UpscaleStatusRequest(BaseModel):
+    state: str
+    detail: dict = {}
+
+
+class UpscaleCompleteRequest(BaseModel):
+    upscaled_path: str
+
+
+@app.post("/api/items/{item_id}/upscale_status")
+async def api_upscale_status(item_id: str, body: UpscaleStatusRequest):
+    """Upscaler service calls this to report progress."""
+    detail_str = json.dumps(body.detail) if body.detail else ""
+    await db.upsert_item({"id": item_id, "state": body.state})
+    await db.log_event(item_id, f"upscaler:{body.state}", detail_str)
+    await broadcast("update", {
+        "reason": "upscale_progress",
+        "item_id": item_id,
+        "state": body.state,
+        "detail": body.detail,
+    })
+    return {"ok": True}
+
+
+@app.post("/api/items/{item_id}/upscale_complete")
+async def api_upscale_complete(item_id: str, body: UpscaleCompleteRequest):
+    """Upscaler service calls this when a file is finished."""
+    result = await engine.promote_upscale_complete(item_id, body.upscaled_path)
+    if result["ok"]:
+        await broadcast("update", {"reason": "upscale_complete", "item_id": item_id})
+    return result
+
+
+@app.post("/api/items/{item_id}/skip_upscale")
+async def api_skip_upscale(item_id: str):
+    """Mark an item to skip upscaling (e.g. user decides SD quality is fine)."""
+    await db.set_state(item_id, "complete", "Upscaling skipped by user")
+    await broadcast("update", {"reason": "skip_upscale", "item_id": item_id})
     return {"ok": True}
 
 

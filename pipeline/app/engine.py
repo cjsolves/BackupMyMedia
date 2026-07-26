@@ -5,12 +5,19 @@ import asyncio
 import logging
 import os
 import shutil
+import subprocess
+import json
 from datetime import datetime, timezone
 
 from app.config import settings
 from app import database as db
 
 log = logging.getLogger("engine")
+
+# Upscaler staging path — the upscaler Docker service watches this
+UPSCALE_STAGING = os.environ.get("PATH_UPSCALE_STAGING", "/media/upscale-queue")
+UPSCALE_OUTPUT  = os.environ.get("PATH_UPSCALE_OUTPUT",  "/media/upscale-output")
+LOSSLESS_ROOT   = settings.PATH_NAS_LOSSLESS
 
 
 # ---------------------------------------------------------------------------
@@ -193,3 +200,141 @@ async def reclassify_item(item_id: str, new_title: str, new_year: str,
     await db.log_event(item_id, "reclassified",
                        f"Manually set to: {new_title} ({new_year}) [{media_type}]")
     return {"ok": True, "new_state": "rip_complete"}
+
+
+# ---------------------------------------------------------------------------
+# Resolution detection + upscale queue management
+# ---------------------------------------------------------------------------
+
+def get_video_resolution(file_path: str) -> tuple[int, int]:
+    """Use ffprobe to get video dimensions. Returns (width, height) or (0,0)."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "v:0", file_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        data = json.loads(result.stdout)
+        streams = data.get("streams", [])
+        if streams:
+            return streams[0].get("width", 0), streams[0].get("height", 0)
+    except Exception as e:
+        log.warning(f"ffprobe failed on {file_path}: {e}")
+    return 0, 0
+
+
+async def check_and_queue_upscale(item_id: str):
+    """
+    Called after a file reaches 'on_nas_lossless'.
+    If the video is below 1080p, copies it to the upscale staging dir and
+    marks it as 'queued_upscale'. The upscaler Docker service picks it up.
+    Items at 1080p or above are left as-is (already correct quality).
+    """
+    item = await db.get_item(item_id)
+    if not item or item.get("media_type") == "music":
+        return  # music never needs upscaling
+
+    lossless_path = item.get("nas_lossless_path", "")
+    if not lossless_path or not os.path.exists(lossless_path):
+        return
+
+    # Find the main MKV file (largest file in the folder)
+    mkv_files = []
+    for root, _, files in os.walk(lossless_path):
+        for f in files:
+            if f.lower().endswith(".mkv"):
+                full = os.path.join(root, f)
+                mkv_files.append((os.path.getsize(full), full))
+
+    if not mkv_files:
+        return
+
+    main_mkv = sorted(mkv_files, reverse=True)[0][1]
+    width, height = await asyncio.get_event_loop().run_in_executor(
+        None, get_video_resolution, main_mkv
+    )
+
+    if height == 0:
+        log.warning(f"[{item_id}] Could not determine resolution")
+        return
+
+    log.info(f"[{item_id}] Resolution: {width}x{height}")
+
+    if height >= 1080:
+        log.info(f"[{item_id}] Already {height}p — no upscaling needed")
+        return
+
+    # Below 1080p: queue for AI upscaling
+    log.info(f"[{item_id}] {height}p < 1080p — queuing for AI upscale")
+
+    staging_dst = os.path.join(UPSCALE_STAGING, item_id)
+    try:
+        os.makedirs(UPSCALE_STAGING, exist_ok=True)
+        if not os.path.exists(staging_dst):
+            # Hard-link first (instant if same volume), fallback to copy
+            try:
+                shutil.copytree(lossless_path, staging_dst)
+            except Exception as e:
+                log.warning(f"[{item_id}] Could not stage for upscale: {e}")
+                return
+    except Exception as e:
+        log.error(f"[{item_id}] Staging copy failed: {e}")
+        return
+
+    await db.upsert_item({
+        "id": item_id,
+        "state": "queued_upscale",
+        "src_path": staging_dst,
+    })
+    await db.log_event(
+        item_id, "queued_upscale",
+        f"{width}x{height} → staged to upscaler. Will be replaced on NAS when complete."
+    )
+
+
+async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
+    """
+    Called by the upscaler service when it finishes.
+    Replaces the NAS Lossless copy with the upscaled version.
+    """
+    item = await db.get_item(item_id)
+    if not item:
+        return {"ok": False, "error": "Item not found"}
+
+    lossless_path = item.get("nas_lossless_path", "")
+    if not lossless_path or not os.path.exists(lossless_path):
+        return {"ok": False, "error": f"NAS Lossless path not found: {lossless_path}"}
+
+    if not os.path.exists(upscaled_path):
+        return {"ok": False, "error": f"Upscaled file not found: {upscaled_path}"}
+
+    # Backup original filename, replace with upscaled
+    try:
+        upscaled_filename = os.path.basename(upscaled_path)
+        dst = os.path.join(lossless_path, upscaled_filename)
+        shutil.move(upscaled_path, dst)
+        log.info(f"[{item_id}] Replaced NAS Lossless with upscaled: {dst}")
+    except Exception as e:
+        return {"ok": False, "error": f"Failed to replace NAS copy: {e}"}
+
+    # Clean up staging copy
+    staging = item.get("src_path", "")
+    if staging and os.path.exists(staging) and "upscale-queue" in staging:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    await db.upsert_item({"id": item_id, "state": "complete", "src_path": None})
+    await db.log_event(item_id, "upscale_complete", f"NAS Lossless replaced with upscaled version")
+
+    return {"ok": True, "replaced": dst}
+
+
+async def check_all_for_upscale():
+    """
+    Scan all 'on_nas_lossless' items to see if any need upscaling.
+    Called periodically by the scheduler.
+    """
+    items = await db.get_all_items()
+    for item in items:
+        if item["state"] == "on_nas_lossless" and not item.get("problem"):
+            await check_and_queue_upscale(item["id"])
+

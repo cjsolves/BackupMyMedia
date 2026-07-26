@@ -162,6 +162,7 @@
   <div class="card blue">  <div class="num" id="c-ripping">—</div><div class="label">Ripping</div></div>
   <div class="card orange"><div class="num" id="c-moving">—</div><div class="label">Moving</div></div>
   <div class="card purple"><div class="num" id="c-transcoding">—</div><div class="label">Transcoding</div></div>
+  <div class="card" style="border-color:var(--border)" id="upscale-card" display="none"><div class="num" id="c-upscale" style="color:var(--yellow)">—</div><div class="label">AI Upscaling ✨</div></div>
   <div class="card green"> <div class="num" id="c-complete">—</div><div class="label">Complete</div></div>
   <div class="card red">   <div class="num" id="c-problems">—</div><div class="label">Problems</div></div>
 </div>
@@ -204,12 +205,14 @@
 // ---- State ----
 let data = null;
 let evtSource = null;
-const STAGE_ORDER = ['ripping','rip_complete','moving_to_nas','on_nas_lossless','queued_transcode','transcoding','complete'];
+const STAGE_ORDER = ['ripping','rip_complete','moving_to_nas','on_nas_lossless','queued_upscale','upscaling','queued_transcode','transcoding','complete'];
 const STAGE_LABELS = {
   ripping:          {label:'Ripping',          color:'var(--blue)',   dot:'#4f8ef7'},
   rip_complete:     {label:'Rip Complete',      color:'var(--orange)', dot:'#f0934a'},
   moving_to_nas:    {label:'Moving to NAS',     color:'var(--orange)', dot:'#f0c84a'},
   on_nas_lossless:  {label:'On NAS (Lossless)', color:'var(--purple)', dot:'#9b78f0'},
+  queued_upscale:   {label:'Upscale Queue',     color:'var(--yellow)', dot:'#f0c84a'},
+  upscaling:        {label:'AI Upscaling ✨',   color:'var(--yellow)', dot:'#f0c84a'},
   queued_transcode: {label:'Transcode Queue',   color:'var(--purple)', dot:'#9b78f0'},
   transcoding:      {label:'Transcoding',       color:'var(--orange)', dot:'#f0934a'},
   complete:         {label:'Complete',          color:'var(--green)',  dot:'#4cba6f'},
@@ -264,6 +267,7 @@ function renderSummary() {
   const ripping = (c.ripping||0);
   const moving  = (c.rip_complete||0) + (c.moving_to_nas||0);
   const trans   = (c.on_nas_lossless||0) + (c.queued_transcode||0) + (c.transcoding||0);
+  const upscale = (c.queued_upscale||0) + (c.upscaling||0);
   const done    = c.complete||0;
   const probs   = c.problem||0;
   document.getElementById('c-ripping').textContent = ripping;
@@ -271,6 +275,9 @@ function renderSummary() {
   document.getElementById('c-transcoding').textContent = trans;
   document.getElementById('c-complete').textContent = done;
   document.getElementById('c-problems').textContent = probs;
+  // Show upscale count in a tooltip on the complete card if active
+  const upscaleEl = document.getElementById('c-upscale');
+  if (upscaleEl) { upscaleEl.textContent = upscale; upscaleEl.parentElement.style.display = upscale > 0 ? '' : 'none'; }
 
   const badge = document.getElementById('badge-problems');
   badge.style.display = probs > 0 ? '' : 'none';
@@ -483,6 +490,12 @@ async function deleteOrphan(id) {
 async function removeTracking(id) {
   if (!confirm(`Remove "${id}" from tracking? (Files will NOT be deleted)`)) return;
   await fetch(`/api/items/${encodeURIComponent(id)}`, {method:'DELETE'});
+  fetchAndRender();
+}
+
+async function skipUpscale(id) {
+  if (!confirm(`Skip AI upscaling for "${id}"? The SD version will be kept as-is.`)) return;
+  await fetch(`/api/items/${encodeURIComponent(id)}/skip_upscale`, {method:'POST'});
   fetchAndRender();
 }
 
