@@ -13,26 +13,36 @@
 $ErrorActionPreference = "Continue"
 
 # --------------------------------------------------------------------------
+# Hard-coded machine roles for this deployment
+# Edit these two lines if your hostnames differ
+# --------------------------------------------------------------------------
+$MINIPC_HOSTNAME       = "A8"          # Mini PC (ripping machine) - your hostname
+$CHRISDESKTOP_HOSTNAME = "Chrisdesktop" # Transcoding machine
+$REMOTE_USER           = "chris"
+
+# --------------------------------------------------------------------------
 # Detect which machine we're on and set the context to create
 # --------------------------------------------------------------------------
 $hostname = $env:COMPUTERNAME.ToLower()
 
-if ($hostname -match 'minipc|mini|rip') {
-    $RemoteHost  = "Chrisdesktop"
+if ($hostname -eq $MINIPC_HOSTNAME.ToLower()) {
+    $RemoteHost  = $CHRISDESKTOP_HOSTNAME
     $RemoteName  = "chrisdesktop"
-    $RemoteUser  = "chris"
-} elseif ($hostname -match 'chris|desktop|transcode') {
-    $RemoteHost  = "MiniPC"
+    $RemoteUser  = $REMOTE_USER
+} elseif ($hostname -eq $CHRISDESKTOP_HOSTNAME.ToLower()) {
+    $RemoteHost  = $MINIPC_HOSTNAME
     $RemoteName  = "minipc"
-    $RemoteUser  = "chris"
+    $RemoteUser  = $REMOTE_USER
 } else {
-    Write-Host "Cannot auto-detect machine role." -ForegroundColor Yellow
-    $RemoteHost = Read-Host "Remote machine hostname (e.g. Chrisdesktop or MiniPC)"
-    $RemoteName = $RemoteHost.ToLower()
-    $RemoteUser = Read-Host "Remote username (e.g. chris)"
+    Write-Host "Machine '$hostname' not recognised — prompting for values." -ForegroundColor Yellow
+    $RemoteHost = Read-Host "Remote machine hostname (Chrisdesktop or $MINIPC_HOSTNAME)"
+    $RemoteName = $RemoteHost.ToLower() -replace '[^a-z0-9]',''
+    $RemoteUser = Read-Host "Remote username (default: $REMOTE_USER)"
+    if ([string]::IsNullOrWhiteSpace($RemoteUser)) { $RemoteUser = $REMOTE_USER }
 }
 
-$SshKey = "$env:USERPROFILE\.ssh\docker_remote"
+$SshDir = "$env:USERPROFILE\.ssh"
+$SshKey = "$SshDir\docker_remote"
 
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Cyan
@@ -49,6 +59,8 @@ Write-Host ""
 if (-not (Test-Path $SshKey)) {
     Write-Host "SSH key not found at $SshKey" -ForegroundColor Yellow
     Write-Host "Generating SSH key pair..." -ForegroundColor Cyan
+    # Ensure .ssh directory exists
+    if (-not (Test-Path $SshDir)) { New-Item -ItemType Directory -Path $SshDir -Force | Out-Null }
     ssh-keygen -t ed25519 -C "$env:COMPUTERNAME-docker-remote" -f $SshKey -N '""'
     Write-Host ""
     Write-Host "Public key to add to $RemoteHost (~/.ssh/authorized_keys):" -ForegroundColor Yellow

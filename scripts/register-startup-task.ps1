@@ -10,11 +10,11 @@
 #Requires -RunAsAdministrator
 
 $TaskName    = "ARM-USB-Drive-Setup"
-$ScriptPath  = "C:\Dev\BackupMyMedia\setup-usb-drives.ps1"
+$ScriptPath  = "C:\Dev\BackupMyMedia\scripts\setup-usb-drives.ps1"
 $Description = "Attaches USB optical drives to WSL2 for the ARM ripping container"
 
 $SyncTaskName   = "ARM-Auto-Sync"
-$SyncScriptPath = "C:\Dev\BackupMyMedia\transfer\watch-and-sync.ps1"
+$SyncScriptPath = "C:\Dev\BackupMyMedia\scripts\transfer\watch-and-sync.ps1"
 $SyncDescription = "Watches for completed ARM rips and auto-syncs them to Chrisdesktop"
 
 # Remove existing task if present
