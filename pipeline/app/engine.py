@@ -275,13 +275,15 @@ async def check_and_queue_upscale(item_id: str):
         "original_height": height,
     })
 
-    if height >= 1080:
-        log.info(f"[{item_id}] Already {height}p — no upscaling needed")
+    threshold = settings.TARGET_UPSCALE_HEIGHT
+
+    if height >= threshold:
+        log.info(f"[{item_id}] Already {height}p >= {threshold}p — no upscaling needed")
         await db.upsert_item({"id": item_id, "upscale_status": "skipped"})
         return
 
-    # Below 1080p: queue for AI upscaling as a PARALLEL background job
-    log.info(f"[{item_id}] {height}p < 1080p — queuing for parallel AI upscale (pipeline continues unblocked)")
+    # Below target: queue for AI upscaling as a PARALLEL background job
+    log.info(f"[{item_id}] {height}p < {threshold}p — queuing for parallel AI upscale (pipeline continues unblocked)")
 
     staging_dst = os.path.join(UPSCALE_STAGING, item_id)
     try:

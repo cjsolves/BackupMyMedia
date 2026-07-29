@@ -170,12 +170,10 @@ services:
       - UPSCALER_OUTPUT=/media/upscale-output
       - UPSCALER_CHECKPOINTS=/data/upscale-checkpoints
       - SCALE_FACTOR=4
-      # Output resolution — set to 1440 for 2K, 2160 for 4K:
-      - TARGET_HEIGHT=1080
-      # Model quality (higher quality = slower):
-      #   RealESRGAN_x4plus          = fast, good (default)
-      #   RealESRGAN_x4plus_anime_6B = fast, best for animation
-      #   HAT-L_SRx4_ImageNet-pretrain = SOTA quality, ~3x slower
+      # Output resolution — 2160 = 4K UHD:
+      - TARGET_HEIGHT=2160
+      # Model — RealESRGAN_x4plus is fast and solid at 4K.
+      # Switch to HAT-L for SOTA quality (set UPSCALE_MODEL=HAT-L_SRx4_ImageNet-pretrain)
       - UPSCALE_MODEL=RealESRGAN_x4plus
       # Video pre-denoise: 0=off, 1-3=light (BluRay), 3-6=medium (DVD), 7-10=heavy (VHS)
       - DENOISE_STRENGTH=3

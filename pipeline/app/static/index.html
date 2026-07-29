@@ -340,10 +340,12 @@ function itemCard(item) {
     upscaleBadge = `<span style="color:var(--yellow);font-size:11px">✨ Upscaling ${item.upscale_pct||0}%</span>`;
   else if (upscale === 'complete')
     upscaleBadge = '<span style="color:var(--green);font-size:11px">✨ 1080p upscaled</span>';
-  else if (item.original_height && item.original_height < 1080 && upscale === 'skipped')
-    upscaleBadge = '<span style="color:var(--muted);font-size:11px">SD (no upscale)</span>';
+  else if (item.original_height && item.original_height >= 2160)
+    upscaleBadge = `<span style="color:var(--green);font-size:11px">4K native</span>`;
   else if (item.original_height && item.original_height >= 1080)
-    upscaleBadge = `<span style="color:var(--muted);font-size:11px">${item.original_height}p native</span>`;
+    upscaleBadge = `<span style="color:var(--muted);font-size:11px">${item.original_height}p (upscale queued)</span>`;
+  else if (item.original_height && item.original_height > 0 && upscale === 'skipped')
+    upscaleBadge = '<span style="color:var(--muted);font-size:11px">native (no upscale)</span>';
   return `
     <div class="item-card ${item.state==='problem'?'problem':''}">
       <div class="item-title" title="${item.id}">${item.title||item.id} ${item.year?`(${item.year})`:''} ${spinner}</div>

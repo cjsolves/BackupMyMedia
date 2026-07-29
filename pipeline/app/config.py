@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     # Upscaler staging (pipeline queues SD files here; upscaler Docker service reads it)
     PATH_UPSCALE_STAGING: str  = "/media/upscale-queue"
     PATH_UPSCALE_OUTPUT: str   = "/media/upscale-output"
+
+    # Resolution threshold — content BELOW this height is queued for AI upscaling
+    # Match this to TARGET_HEIGHT in chrisdesktop/docker-compose.yml
+    TARGET_UPSCALE_HEIGHT: int = 2160   # 1080=Full HD, 1440=2K, 2160=4K
     TDARR_LIBRARY_TV: str     = ""
 
     STUCK_THRESHOLD_RIPPING: int     = 180
