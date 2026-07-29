@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     STUCK_THRESHOLD_TRANSCODING: int = 240
     STUCK_THRESHOLD_UPSCALING: int   = 1440  # 24 hours (upscaling is slow)
 
+    # Plex Media Server — auto-refresh library after transcoding completes
+    PLEX_HOST: str  = "NAS"    # hostname or IP of Plex server
+    PLEX_PORT: str  = "32400"
+    PLEX_TOKEN: str = ""       # required for Plex auth — see support.plex.tv/articles/204059436
+
     DB_PATH: str = "/data/pipeline.db"
 
     class Config:

@@ -45,6 +45,18 @@ services:
       PATH_MINIPC_MUSIC:     "/media/minipc/music"
       PATH_NAS_LOSSLESS:     "/media/nas/Lossless"
       PATH_NAS_PLEX:         "/media/nas/Plex"
+      PATH_BULK_INTAKE:      "/media/bulk-intake"
+      PATH_UPSCALE_STAGING:  "/media/upscale-queue"
+      PATH_UPSCALE_OUTPUT:   "/media/upscale-output"
+
+      # Resolution threshold: queue everything below this for AI upscaling
+      TARGET_UPSCALE_HEIGHT: "2160"
+
+      # Plex integration: auto-refresh library after new content is transcoded
+      # Get your token: https://support.plex.tv/articles/204059436/
+      PLEX_HOST: "NAS"          # hostname or IP of the Plex server
+      PLEX_PORT: "32400"
+      PLEX_TOKEN: ""            # set your Plex token here
 
       # -----------------------------------------------------------------------
       # Tdarr library IDs for the Movies and TV libraries

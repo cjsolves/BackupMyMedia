@@ -50,6 +50,14 @@ async def _run_poll():
     await engine.detect_stuck_jobs()
     await engine.move_rip_complete_items()
     await engine.check_all_for_upscale()   # queue SD content for AI upscaling
+
+    # Auto-refresh Plex if any items just completed transcoding
+    items = await db.get_all_items()
+    newly_complete = [i for i in items if i["state"] == "complete"
+                      and i.get("nas_plex_path")]
+    if newly_complete:
+        await engine.trigger_plex_refresh()
+
     await broadcast("update", {"ts": datetime.now(timezone.utc).isoformat()})
 
 

@@ -366,3 +366,40 @@ async def check_all_for_upscale():
         if item["state"] == "on_nas_lossless" and not item.get("problem"):
             await check_and_queue_upscale(item["id"])
 
+
+# ---------------------------------------------------------------------------
+# Plex library refresh
+# ---------------------------------------------------------------------------
+
+async def trigger_plex_refresh():
+    """
+    Trigger a Plex Media Server library refresh.
+    Called after an item reaches 'complete' state.
+    Non-blocking: failure is logged but does not affect the pipeline.
+    """
+    if not settings.PLEX_TOKEN:
+        return  # no token configured, skip silently
+
+    import httpx
+    base = f"http://{settings.PLEX_HOST}:{settings.PLEX_PORT}"
+    token_param = f"?X-Plex-Token={settings.PLEX_TOKEN}"
+    try:
+        # Get all library sections
+        r = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: __import__("httpx").get(f"{base}/library/sections{token_param}", timeout=8)
+        )
+        if r.status_code == 200:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r.text)
+            for section in root.findall("Directory"):
+                key = section.get("key")
+                __import__("httpx").get(
+                    f"{base}/library/sections/{key}/refresh{token_param}", timeout=5
+                )
+            log.info(f"Plex library refresh triggered ({len(root.findall('Directory'))} sections)")
+        else:
+            log.warning(f"Plex refresh returned {r.status_code}")
+    except Exception as e:
+        log.warning(f"Plex refresh failed (non-fatal): {e}")
+
