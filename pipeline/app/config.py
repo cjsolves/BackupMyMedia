@@ -11,11 +11,13 @@ class Settings(BaseSettings):
     PATH_NAS_LOSSLESS: str     = "/media/nas/Lossless"
     PATH_NAS_PLEX: str         = "/media/nas/Plex"
 
+    # Bulk intake: drop existing ripped files here for pipeline processing
+    # Files are moved into Lossless/ and processed end-to-end
+    PATH_BULK_INTAKE: str   = "/media/bulk-intake"
+
     # Upscaler staging (pipeline queues SD files here; upscaler Docker service reads it)
     PATH_UPSCALE_STAGING: str  = "/media/upscale-queue"
     PATH_UPSCALE_OUTPUT: str   = "/media/upscale-output"
-
-    TDARR_LIBRARY_MOVIES: str = ""
     TDARR_LIBRARY_TV: str     = ""
 
     STUCK_THRESHOLD_RIPPING: int     = 180

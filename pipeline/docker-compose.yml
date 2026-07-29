@@ -73,6 +73,14 @@ services:
       - "//NAS/Lossless:/media/nas/Lossless"
       - "//NAS/Plex:/media/nas/Plex"
 
+      # Bulk intake — drop large libraries here for end-to-end processing
+      # POST http://localhost:8090/api/bulk_intake/scan to process
+      - "D:/PlexMedia/BulkIngest:/media/bulk-intake"
+
+      # Upscaler staging (shared with upscaler service)
+      - "D:/PlexMedia/UpscaleQueue:/media/upscale-queue"
+      - "D:/PlexMedia/UpscaleOutput:/media/upscale-output"
+
     # Tdarr is on the same machine - use host network so localhost:8266 works
     network_mode: host
 

@@ -227,12 +227,20 @@ async def check_and_queue_upscale(item_id: str):
     """
     Called after a file reaches 'on_nas_lossless'.
     If the video is below 1080p, copies it to the upscale staging dir and
-    marks it as 'queued_upscale'. The upscaler Docker service picks it up.
-    Items at 1080p or above are left as-is (already correct quality).
+    marks upscale_status='queued'.
+
+    IMPORTANT: This does NOT change the main pipeline state.
+    The item continues through on_nas_lossless -> queued_transcode -> transcoding -> complete
+    in parallel. When the upscale completes, it replaces the NAS Lossless copy and
+    signals Tdarr to re-transcode the upscaled version.
     """
     item = await db.get_item(item_id)
     if not item or item.get("media_type") == "music":
         return  # music never needs upscaling
+
+    # Already queued/processed
+    if item.get("upscale_status") in ("queued", "processing", "complete", "skipped"):
+        return
 
     lossless_path = item.get("nas_lossless_path", "")
     if not lossless_path or not os.path.exists(lossless_path):
@@ -255,40 +263,43 @@ async def check_and_queue_upscale(item_id: str):
     )
 
     if height == 0:
-        log.warning(f"[{item_id}] Could not determine resolution")
+        log.warning(f"[{item_id}] Could not determine resolution — skipping upscale check")
         return
 
     log.info(f"[{item_id}] Resolution: {width}x{height}")
 
+    # Store original resolution regardless
+    await db.upsert_item({
+        "id": item_id,
+        "original_width": width,
+        "original_height": height,
+    })
+
     if height >= 1080:
         log.info(f"[{item_id}] Already {height}p — no upscaling needed")
+        await db.upsert_item({"id": item_id, "upscale_status": "skipped"})
         return
 
-    # Below 1080p: queue for AI upscaling
-    log.info(f"[{item_id}] {height}p < 1080p — queuing for AI upscale")
+    # Below 1080p: queue for AI upscaling as a PARALLEL background job
+    log.info(f"[{item_id}] {height}p < 1080p — queuing for parallel AI upscale (pipeline continues unblocked)")
 
     staging_dst = os.path.join(UPSCALE_STAGING, item_id)
     try:
         os.makedirs(UPSCALE_STAGING, exist_ok=True)
         if not os.path.exists(staging_dst):
-            # Hard-link first (instant if same volume), fallback to copy
-            try:
-                shutil.copytree(lossless_path, staging_dst)
-            except Exception as e:
-                log.warning(f"[{item_id}] Could not stage for upscale: {e}")
-                return
+            shutil.copytree(lossless_path, staging_dst)
     except Exception as e:
         log.error(f"[{item_id}] Staging copy failed: {e}")
         return
 
+    # Mark as queued in the UPSCALE TRACK only — main pipeline state is untouched
     await db.upsert_item({
         "id": item_id,
-        "state": "queued_upscale",
-        "src_path": staging_dst,
+        "upscale_status": "queued",
     })
     await db.log_event(
-        item_id, "queued_upscale",
-        f"{width}x{height} → staged to upscaler. Will be replaced on NAS when complete."
+        item_id, "upscale_queued",
+        f"{width}x{height} → queued for AI upscale to 1080p. Main pipeline continues."
     )
 
 
@@ -296,6 +307,9 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
     """
     Called by the upscaler service when it finishes.
     Replaces the NAS Lossless copy with the upscaled version.
+    The main pipeline state is NOT changed here — if the item is already complete
+    (Tdarr finished the SD version), we re-queue it for Tdarr to re-transcode the
+    upscaled version. If still transcoding, Tdarr will pick up the updated file.
     """
     item = await db.get_item(item_id)
     if not item:
@@ -308,7 +322,6 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
     if not os.path.exists(upscaled_path):
         return {"ok": False, "error": f"Upscaled file not found: {upscaled_path}"}
 
-    # Backup original filename, replace with upscaled
     try:
         upscaled_filename = os.path.basename(upscaled_path)
         dst = os.path.join(lossless_path, upscaled_filename)
@@ -318,12 +331,25 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
         return {"ok": False, "error": f"Failed to replace NAS copy: {e}"}
 
     # Clean up staging copy
-    staging = item.get("src_path", "")
-    if staging and os.path.exists(staging) and "upscale-queue" in staging:
+    staging = os.path.join(UPSCALE_STAGING, item_id)
+    if os.path.exists(staging):
         shutil.rmtree(staging, ignore_errors=True)
 
-    await db.upsert_item({"id": item_id, "state": "complete", "src_path": None})
-    await db.log_event(item_id, "upscale_complete", f"NAS Lossless replaced with upscaled version")
+    # Mark upscale track as complete
+    await db.upsert_item({
+        "id": item_id,
+        "upscale_status": "complete",
+        "upscale_pct": 100,
+        "upscale_completed_at": "datetime('now')",
+    })
+    await db.log_event(item_id, "upscale_complete",
+                       "NAS Lossless replaced with 1080p upscaled version")
+
+    # If main pipeline is already 'complete', re-queue for Tdarr to re-transcode
+    if item.get("state") == "complete":
+        await db.set_state(item_id, "on_nas_lossless",
+                           "Re-queuing for Tdarr to transcode upscaled version")
+        log.info(f"[{item_id}] Re-queued for Tdarr transcode of upscaled version")
 
     return {"ok": True, "replaced": dst}
 

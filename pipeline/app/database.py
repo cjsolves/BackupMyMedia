@@ -21,7 +21,14 @@ CREATE TABLE IF NOT EXISTS items (
     nas_plex_path     TEXT,
     created_at  TEXT DEFAULT (datetime('now')),
     updated_at  TEXT DEFAULT (datetime('now')),
-    size_bytes  INTEGER DEFAULT 0
+    size_bytes  INTEGER DEFAULT 0,
+    -- Upscale track (runs in parallel, never blocks the main pipeline state)
+    upscale_status     TEXT DEFAULT NULL,  -- null/queued/processing/complete/failed/skipped
+    upscale_pct        INTEGER DEFAULT 0,  -- 0-100 progress
+    original_width     INTEGER DEFAULT 0,
+    original_height    INTEGER DEFAULT 0,
+    upscale_started_at TEXT,
+    upscale_completed_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -31,6 +38,15 @@ CREATE TABLE IF NOT EXISTS events (
     event      TEXT,
     detail     TEXT
 );
+"""
+
+UPSCALE_MIGRATE_SQL = """
+ALTER TABLE items ADD COLUMN upscale_status TEXT DEFAULT NULL;
+ALTER TABLE items ADD COLUMN upscale_pct INTEGER DEFAULT 0;
+ALTER TABLE items ADD COLUMN original_width INTEGER DEFAULT 0;
+ALTER TABLE items ADD COLUMN original_height INTEGER DEFAULT 0;
+ALTER TABLE items ADD COLUMN upscale_started_at TEXT;
+ALTER TABLE items ADD COLUMN upscale_completed_at TEXT;
 """
 
 # Valid pipeline states in order
@@ -63,6 +79,18 @@ PROBLEM_CODES = {
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.executescript(CREATE_SQL)
+        # Add upscale columns to existing databases (migration)
+        existing_cols = {row[1] async for row in await db.execute("PRAGMA table_info(items)")}
+        for stmt in UPSCALE_MIGRATE_SQL.strip().split(";"):
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            col_name = stmt.split("ADD COLUMN")[1].split()[0].strip()
+            if col_name not in existing_cols:
+                try:
+                    await db.execute(stmt)
+                except Exception:
+                    pass
         await db.commit()
 
 

@@ -18,6 +18,7 @@ from pydantic import BaseModel
 
 from app import database as db, engine, poller
 from app.config import settings
+from app.bulk_intake import scan_bulk_intake
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 log = logging.getLogger("main")
@@ -205,15 +206,22 @@ class UpscaleCompleteRequest(BaseModel):
 
 @app.post("/api/items/{item_id}/upscale_status")
 async def api_upscale_status(item_id: str, body: UpscaleStatusRequest):
-    """Upscaler service calls this to report progress."""
-    detail_str = json.dumps(body.detail) if body.detail else ""
-    await db.upsert_item({"id": item_id, "state": body.state})
-    await db.log_event(item_id, f"upscaler:{body.state}", detail_str)
+    """Upscaler service calls this to report progress. Updates upscale_status column only."""
+    pct = body.detail.get("pct", 0) if body.detail else 0
+    await db.upsert_item({
+        "id": item_id,
+        "upscale_status": body.state,
+        "upscale_pct": pct,
+    })
+    if body.state == "processing" and not await db.get_item(item_id):
+        pass  # item not tracked yet, skip
+    await db.log_event(item_id, f"upscale:{body.state}",
+                       json.dumps(body.detail) if body.detail else "")
     await broadcast("update", {
         "reason": "upscale_progress",
         "item_id": item_id,
-        "state": body.state,
-        "detail": body.detail,
+        "upscale_state": body.state,
+        "pct": pct,
     })
     return {"ok": True}
 
@@ -233,6 +241,69 @@ async def api_skip_upscale(item_id: str):
     await db.set_state(item_id, "complete", "Upscaling skipped by user")
     await broadcast("update", {"reason": "skip_upscale", "item_id": item_id})
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Bulk Intake — drop existing ripped files for end-to-end processing
+# ---------------------------------------------------------------------------
+
+class BulkIntakeRequest(BaseModel):
+    dry_run: bool = False
+
+
+@app.post("/api/bulk_intake/scan")
+async def api_bulk_intake(body: BulkIntakeRequest = BulkIntakeRequest()):
+    """
+    Scan the bulk intake folder and move video files into the Lossless library.
+    After moving, the pipeline scheduler will:
+      1. Pick them up in the next scan (within 30s)
+      2. Check their resolution and queue for upscaling if < TARGET_HEIGHT
+      3. Tdarr will transcode them to H.265 for Plex
+
+    Bulk intake folder: D:/PlexMedia/BulkIngest/  (on Chrisdesktop)
+    Drop files in any structure — flat dump or pre-organised Movies/TV folders.
+    """
+    intake_path   = settings.PATH_BULK_INTAKE
+    lossless_path = settings.PATH_NAS_LOSSLESS
+
+    if not os.path.isdir(intake_path):
+        return {"ok": False, "error": f"Bulk intake path not found: {intake_path}. Create D:\\PlexMedia\\BulkIngest\\"}
+
+    results = await asyncio.get_event_loop().run_in_executor(
+        None,
+        scan_bulk_intake,
+        intake_path,
+        os.path.join(lossless_path, "Movies"),
+        os.path.join(lossless_path, "TV"),
+        body.dry_run,
+    )
+
+    moved   = [r for r in results if r.get("ok") and not r.get("dry_run")]
+    failed  = [r for r in results if not r.get("ok")]
+    preview = [r for r in results if r.get("dry_run")]
+
+    if not body.dry_run:
+        # Trigger immediate pipeline scan to pick up the new files
+        asyncio.create_task(_run_poll())
+        await broadcast("update", {"reason": "bulk_intake", "count": len(moved)})
+
+    return {
+        "ok": True,
+        "dry_run": body.dry_run,
+        "total_found": len(results),
+        "moved": len(moved),
+        "failed": len(failed),
+        "preview": preview if body.dry_run else [],
+        "errors": [r.get("error") for r in failed],
+        "items": [{"title": r["title"], "type": r["type"], "dest": r.get("dest_dir")} for r in results],
+        "next_steps": "Pipeline will pick these up within 30 seconds and check resolution, queue upscaling if < 1080p, then Tdarr transcodes to H.265 for Plex.",
+    }
+
+
+@app.get("/api/bulk_intake/preview")
+async def api_bulk_intake_preview():
+    """Preview what a bulk intake scan would do without moving anything."""
+    return await api_bulk_intake(BulkIntakeRequest(dry_run=True))
 
 
 @app.post("/api/refresh")
