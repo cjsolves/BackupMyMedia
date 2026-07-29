@@ -39,8 +39,27 @@ if (-not (Get-Command usbipd -ErrorAction SilentlyContinue)) {
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "  ARM USB Drive Setup" -ForegroundColor Cyan
+Write-Host "  (runs at logon to attach drives to WSL2)" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
+
+# --------------------------------------------------------------------------
+# Ensure Docker Desktop is running before we attach drives
+# (ARM container needs Docker; drives must exist when container starts)
+# --------------------------------------------------------------------------
+Write-Host "Checking Docker Desktop..." -ForegroundColor Yellow
+$dockerRunning = $false
+for ($i = 0; $i -lt 12; $i++) {
+    $info = docker info 2>&1 | Select-String 'Server Version'
+    if ($info) { $dockerRunning = $true; break }
+    if ($i -eq 0) {
+        Write-Host "  Docker not responding — starting Docker Desktop..." -ForegroundColor Gray
+        Start-Process "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe" -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 10
+}
+if ($dockerRunning) { Write-Host "  Docker Desktop: running" -ForegroundColor Green }
+else { Write-Host "  Docker Desktop: not responding (continuing anyway)" -ForegroundColor Yellow }
 
 # --------------------------------------------------------------------------
 # Ensure Ubuntu WSL2 is running - usbipd needs it active to load vhci_hcd
@@ -190,18 +209,26 @@ Write-Host "============================================" -ForegroundColor Cyan
 
 if ($attachedCount -gt 0) {
     Write-Host "  $attachedCount drive(s) attached successfully." -ForegroundColor Green
+
+    # Restart ARM container so Docker picks up the new /dev/sr* device nodes
     Write-Host ""
-    Write-Host "  Start ARM:" -ForegroundColor White
-    Write-Host "    cd ripping-machine" -ForegroundColor White
-    Write-Host "    docker compose up -d" -ForegroundColor White
+    Write-Host "  Restarting ARM container to recognise new drives..." -ForegroundColor Cyan
+    Start-Sleep -Seconds 3
+    $restartResult = docker restart arm-rippers 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Start-Sleep -Seconds 12
+        $status = docker ps --filter "name=arm-rippers" --format "{{.Status}}" 2>&1
+        Write-Host "  ARM status: $status" -ForegroundColor Green
+        Write-Host "  Web UI: http://localhost:8080" -ForegroundColor Cyan
+    } else {
+        Write-Host "  ARM not running — starting..." -ForegroundColor Yellow
+        Set-Location "C:\Dev\BackupMyMedia\ripping-machine"
+        docker compose up -d 2>&1 | Out-Null
+        Write-Host "  ARM started" -ForegroundColor Green
+    }
 } else {
     Write-Host "  No drives were attached. Check errors above." -ForegroundColor Red
 }
 
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "TIP: To run this script automatically at logon:" -ForegroundColor Yellow
-Write-Host "     Task Scheduler -> New Task -> Trigger: At logon" -ForegroundColor Yellow
-Write-Host "     Action: powershell.exe -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -ForegroundColor Yellow
-Write-Host "     Check: 'Run with highest privileges'" -ForegroundColor Yellow
 Write-Host ""

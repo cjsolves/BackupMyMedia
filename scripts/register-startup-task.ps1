@@ -1,104 +1,141 @@
 <#
 .SYNOPSIS
-    Registers setup-usb-drives.ps1 as a Task Scheduler task that runs automatically
-    at logon (with a 45-second delay to allow Docker Desktop and WSL2 to start first).
+    Registers all ARM startup tasks with Task Scheduler and enables Docker Desktop
+    auto-start so the full pipeline resumes automatically after every reboot.
+
+    Startup sequence after reboot:
+      1. [Logon]       Docker Desktop starts (registry auto-start)
+      2. [Logon +45s]  ARM-USB-Drive-Setup  — attaches USB drives to WSL2 (ADMIN)
+                       then restarts ARM container to see new /dev/sr* devices
+      3. [Logon +0s]   ARM-Auto-Sync        — watches completed/ and syncs to Chrisdesktop
+
+    ARM container itself restarts automatically via Docker's restart:unless-stopped policy.
 
 .NOTES
-    Run this ONCE as Administrator. After that, the task runs automatically on every logon.
+    Run this ONCE as Administrator.
+    After that, everything starts automatically on every Windows restart.
 #>
 
 #Requires -RunAsAdministrator
 
-$TaskName    = "ARM-USB-Drive-Setup"
-$ScriptPath  = "C:\Dev\BackupMyMedia\scripts\setup-usb-drives.ps1"
-$Description = "Attaches USB optical drives to WSL2 for the ARM ripping container"
+$RepoRoot = "C:\Dev\BackupMyMedia"
 
-$SyncTaskName   = "ARM-Auto-Sync"
-$SyncScriptPath = "C:\Dev\BackupMyMedia\scripts\transfer\watch-and-sync.ps1"
-$SyncDescription = "Watches for completed ARM rips and auto-syncs them to Chrisdesktop"
+# Task definitions
+$Tasks = @(
+    @{
+        Name        = "ARM-USB-Drive-Setup"
+        Script      = "$RepoRoot\scripts\setup-usb-drives.ps1"
+        Description = "Attaches USB optical drives to WSL2, restarts ARM container. ADMIN required."
+        Delay       = "PT45S"    # 45s — lets Docker Desktop initialise first
+        RunLevel    = "Highest"  # needs admin for usbipd bind/attach
+        RestartCount = 3
+        RestartMins  = 2
+    },
+    @{
+        Name        = "ARM-Auto-Sync"
+        Script      = "$RepoRoot\scripts\transfer\watch-and-sync.ps1"
+        Description = "Watches completed/ rips and auto-syncs to Chrisdesktop. No admin needed."
+        Delay       = "PT10S"    # 10s — just enough for filesystem to settle
+        RunLevel    = "Limited"  # no admin needed
+        RestartCount = 5
+        RestartMins  = 1
+    }
+)
 
-# Remove existing task if present
-Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-
-# Build the action: run PowerShell hidden, bypass execution policy
-$action = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
-    -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$ScriptPath`""
-
-# Trigger: at logon of any user, with a 45-second delay
-# (allows Docker Desktop + WSL2 to initialise before the script runs)
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$trigger.Delay = "PT45S"   # ISO 8601: 45 seconds
-
-# Settings: run with highest privileges, allow running on battery, etc.
-$settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries
-
-# Principal: run as current user with highest privileges (UAC elevation)
-$principal = New-ScheduledTaskPrincipal `
-    -UserId "$env:USERDOMAIN\$env:USERNAME" `
-    -LogonType Interactive `
-    -RunLevel Highest
-
-$task = Register-ScheduledTask `
-    -TaskName    $TaskName `
-    -Action      $action `
-    -Trigger     $trigger `
-    -Settings    $settings `
-    -Principal   $principal `
-    -Description $Description `
-    -Force
+Write-Host ""
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host "  ARM Startup Task Registration" -ForegroundColor Cyan
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host ""
 
 # --------------------------------------------------------------------------
-# Task 2: ARM-Auto-Sync
-# Watches completed/ folder and syncs finished rips to Chrisdesktop silently
-# Does NOT need admin - runs as current user, starts at logon with no delay
+# Step 1: Enable Docker Desktop auto-start at login
+# (sets HKCU registry run key — no admin needed, but we're admin so fine)
 # --------------------------------------------------------------------------
-Unregister-ScheduledTask -TaskName $SyncTaskName -Confirm:$false -ErrorAction SilentlyContinue
+Write-Host "=== Docker Desktop auto-start ==" -ForegroundColor Yellow
 
-$syncAction = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
-    -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$SyncScriptPath`""
+$dockerExe = "$env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
+if (Test-Path $dockerExe) {
+    $regKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+    $existing = Get-ItemProperty $regKey -Name "Docker Desktop" -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Host "  Docker Desktop auto-start: already configured" -ForegroundColor Gray
+    } else {
+        Set-ItemProperty $regKey -Name "Docker Desktop" -Value "`"$dockerExe`""
+        Write-Host "  Docker Desktop auto-start: enabled" -ForegroundColor Green
+    }
+} else {
+    Write-Host "  Docker Desktop not found at $dockerExe" -ForegroundColor Yellow
+}
 
-$syncTrigger = New-ScheduledTaskTrigger -AtLogOn
-# No delay needed - this just watches the filesystem, doesn't depend on Docker
+# --------------------------------------------------------------------------
+# Step 2: Register each task
+# --------------------------------------------------------------------------
+foreach ($t in $Tasks) {
+    Write-Host ""
+    Write-Host "=== Task: $($t.Name) ==" -ForegroundColor Yellow
 
-$syncSettings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1)
+    # Remove old registration (in case path changed)
+    Unregister-ScheduledTask -TaskName $t.Name -Confirm:$false -ErrorAction SilentlyContinue
 
-$syncPrincipal = New-ScheduledTaskPrincipal `
-    -UserId "$env:USERDOMAIN\$env:USERNAME" `
-    -LogonType Interactive `
-    -RunLevel Limited    # Does NOT need admin
+    $action = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument "-ExecutionPolicy Bypass -NonInteractive -WindowStyle Hidden -File `"$($t.Script)`""
 
-Register-ScheduledTask `
-    -TaskName    $SyncTaskName `
-    -Action      $syncAction `
-    -Trigger     $syncTrigger `
-    -Settings    $syncSettings `
-    -Principal   $syncPrincipal `
-    -Description $SyncDescription `
-    -Force | Out-Null
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $trigger.Delay = $t.Delay
 
+    $settings = New-ScheduledTaskSettingsSet `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -RestartCount $t.RestartCount `
+        -RestartInterval (New-TimeSpan -Minutes $t.RestartMins) `
+        -MultipleInstances IgnoreNew
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId "$env:USERDOMAIN\$env:USERNAME" `
+        -LogonType Interactive `
+        -RunLevel $t.RunLevel
+
+    $registered = Register-ScheduledTask `
+        -TaskName    $t.Name `
+        -Action      $action `
+        -Trigger     $trigger `
+        -Settings    $settings `
+        -Principal   $principal `
+        -Description $t.Description `
+        -Force
+
+    Write-Host "  Registered: $($t.Name)" -ForegroundColor Green
+    Write-Host "    Script  : $($t.Script)"
+    Write-Host "    Delay   : $($t.Delay) after logon"
+    Write-Host "    RunLevel: $($t.RunLevel)"
+    Write-Host "    Restarts: up to $($t.RestartCount)x every $($t.RestartMins) min if it fails"
+}
+
+# --------------------------------------------------------------------------
+# Step 3: Verify
+# --------------------------------------------------------------------------
 Write-Host ""
 Write-Host "================================================" -ForegroundColor Green
-Write-Host "  Task Scheduler entries registered!" -ForegroundColor Green
+Write-Host "  All tasks registered!" -ForegroundColor Green
 Write-Host "================================================" -ForegroundColor Green
 Write-Host ""
-Write-Host "  $TaskName     - USB drives attached at logon +45s" -ForegroundColor Cyan
-Write-Host "  $SyncTaskName - Auto-sync rips to Chrisdesktop (background)" -ForegroundColor Cyan
+Write-Host "Startup sequence after next reboot:" -ForegroundColor Cyan
+Write-Host "  [Logon]      Docker Desktop auto-starts (registry run key)" -ForegroundColor White
+Write-Host "  [Logon +10s] ARM-Auto-Sync starts (watches completed/ -> Chrisdesktop)" -ForegroundColor White
+Write-Host "  [Logon +45s] ARM-USB-Drive-Setup runs (admin):" -ForegroundColor White
+Write-Host "               1. Start Ubuntu WSL2" -ForegroundColor Gray
+Write-Host "               2. Attach USB optical drives via usbipd" -ForegroundColor Gray
+Write-Host "               3. Restart ARM container to see drives" -ForegroundColor Gray
+Write-Host "               4. ARM web UI ready at http://localhost:8080" -ForegroundColor Gray
 Write-Host ""
-Write-Host "From now on, after every Windows restart:" -ForegroundColor Yellow
-Write-Host "  1. Log in normally" -ForegroundColor White
-Write-Host "  2. Wait ~60 seconds for Docker Desktop + drives to initialise" -ForegroundColor White
-Write-Host "  3. Insert a disc - ARM rips it, then auto-syncs to Chrisdesktop" -ForegroundColor White
+Write-Host "Registered tasks:" -ForegroundColor Cyan
+Get-ScheduledTask | Where-Object { $_.TaskName -match 'ARM' } |
+    Select-Object TaskName, State | Format-Table -AutoSize
 Write-Host ""
+Write-Host "To run immediately without rebooting:" -ForegroundColor Yellow
+Write-Host "  Start-ScheduledTask 'ARM-Auto-Sync'" -ForegroundColor White
+Write-Host "  Start-ScheduledTask 'ARM-USB-Drive-Setup'" -ForegroundColor White
 
-# Verify
-Get-ScheduledTask | Where-Object { $_.TaskName -match 'ARM' } | Select-Object TaskName, State | Format-Table -AutoSize
