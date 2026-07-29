@@ -201,16 +201,27 @@ Write-Host "  File share:     \\$env:COMPUTERNAME\Videoinbox" -ForegroundColor W
 Write-Host "  SSH server:     Enabled (Mini PC can now remote-deploy here)" -ForegroundColor White
 Write-Host ""
 Write-Host "  NEXT STEPS:" -ForegroundColor Yellow
-Write-Host "  1. Open Tdarr at http://localhost:8265 and add two libraries:" -ForegroundColor White
-Write-Host "       Movies: /media/lossless/Movies  ->  /media/plex/Movies" -ForegroundColor Gray
-Write-Host "       TV:     /media/lossless/TV       ->  /media/plex/TV" -ForegroundColor Gray
-Write-Host "       FFmpeg args: -c:v hevc_nvenc -preset p4 -cq 18 -c:a copy -c:s copy" -ForegroundColor Gray
-Write-Host "  2. Open Pipeline at http://localhost:8090 to monitor the media pipeline" -ForegroundColor White
-Write-Host "  3. Point Plex at:" -ForegroundColor White
-Write-Host "       Movies: D:\PlexMedia\Plex\Movies" -ForegroundColor Gray
-Write-Host "       TV:     D:\PlexMedia\Plex\TV" -ForegroundColor Gray
-Write-Host "       Music:  D:\PlexMedia\Lossless\Music" -ForegroundColor Gray
+Write-Host "  1. On the NAS (Windows): run install-nas.ps1 as Administrator" -ForegroundColor White
+Write-Host "     This creates the NAS folder structure, SMB shares, and configures Plex" -ForegroundColor Gray
 Write-Host ""
-Write-Host "  From Mini PC (after SSH key setup), deploy updates with:" -ForegroundColor Yellow
+Write-Host "  2. Update pipeline\docker-compose.yml NAS volume paths:" -ForegroundColor White
+Write-Host "     Replace 'NAS' with your NAS hostname or IP in these lines:" -ForegroundColor Gray
+Write-Host "       - //NAS/Lossless:/media/nas/Lossless" -ForegroundColor Gray
+Write-Host "       - //NAS/Plex:/media/nas/Plex" -ForegroundColor Gray
+Write-Host "     Then restart: docker compose -f pipeline\docker-compose.yml up -d" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  3. Open Tdarr at http://localhost:8265 and add two libraries:" -ForegroundColor White
+Write-Host "       Movies: /media/nas/Lossless/Movies  ->  /media/nas/Plex/Movies" -ForegroundColor Gray
+Write-Host "       TV:     /media/nas/Lossless/TV       ->  /media/nas/Plex/TV" -ForegroundColor Gray
+Write-Host "       FFmpeg args: -c:v hevc_nvenc -preset p4 -cq 18 -c:a copy -c:s copy" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  4. In Plex on the NAS: add libraries pointing to NAS paths" -ForegroundColor White
+Write-Host "       Movies: <NAS media root>\Plex\Movies" -ForegroundColor Gray
+Write-Host "       TV:     <NAS media root>\Plex\TV" -ForegroundColor Gray
+Write-Host "       Music:  <NAS media root>\Lossless\Music" -ForegroundColor Gray
+Write-Host ""
+Write-Host "  5. Open Pipeline dashboard at http://localhost:8090" -ForegroundColor White
+Write-Host ""
+Write-Host "  6. From Mini PC (after SSH key setup), deploy updates with:" -ForegroundColor Yellow
 Write-Host "    docker --context chrisdesktop compose -f chrisdesktop/docker-compose.yml up -d --pull always" -ForegroundColor White
 Write-Host ""
