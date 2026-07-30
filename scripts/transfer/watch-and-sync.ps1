@@ -21,7 +21,7 @@
 $SRC_COMPLETED_MOVIES      = "C:\BackupOfMedia\media\completed\movies"
 $SRC_COMPLETED_UNIDENTIFIED = "C:\BackupOfMedia\media\completed\unidentified"
 $SRC_MUSIC       = "C:\BackupOfMedia\music"
-$DST_BASE=        "\\\\Chrisdesktop\\Videoinbox"
+$DST_BASE        = "\\Chrisdesktop\Videoinbox"
 $DST_COMPLETED   = "$DST_BASE\completed"
 $DST_MUSIC       = "$DST_BASE\music"
 $LOG              = "C:\BackupOfMedia\sync.log"
@@ -39,7 +39,7 @@ function Write-Log {
 # --------------------------------------------------------------------------
 function Test-Destination {
     param([string]$Path)
-    if (-not (Test-Path $Path)) {
+    if (-not (Test-Path $Path -ErrorAction SilentlyContinue)) {
         Write-Log "Destination unreachable: $Path - will retry later" "WARN"
         return $false
     }
@@ -143,7 +143,7 @@ $actionVideo = {
             $DST_COMPLETED = $using:DST_COMPLETED
             $LOG           = $using:LOG
             function Write-Log { param($m,$l="INFO"); $line="$(Get-Date -f 'yyyy-MM-dd HH:mm:ss') [$l] $m"; Add-Content $using:LOG $line -Encoding UTF8; Write-Host $line }
-            function Test-Destination { param($p); if(-not(Test-Path $p)){Write-Log "Destination unreachable: $p" "WARN";return $false};return $true }
+            function Test-Destination { param($p); if(-not(Test-Path $p -ErrorAction SilentlyContinue)){Write-Log "Destination unreachable: $p" "WARN";return $false};return $true }
             Write-Log "[Video] New rip detected: $name"
             if (Test-Destination $DST_COMPLETED) {
                 $dst = Join-Path $DST_COMPLETED $name
