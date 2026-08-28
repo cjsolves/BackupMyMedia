@@ -240,15 +240,16 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
         "total_frames":frame_count(input_path),"last_frame":0,"fps_str":fps_str,"status":"in_progress",
     }
     save_ckpt(item_id, ckpt)
-    resume_pct = int(100 * ckpt["last_frame"] / max(ckpt["total_frames"], 1))
-    _api(item_id, "processing", {"step":"resuming" if ckpt["last_frame"] > 0 else "starting", "pct": resume_pct})
+    # Always re-extract from frame 0 — temp dir is cleared on each run so partial
+    # frame sets can't be assembled into a complete video after a restart.
+    start_frame = 0
+    _api(item_id, "processing", {"step":"resuming" if ckpt["last_frame"] > 0 else "starting", "pct": 0})
 
     with tempfile.TemporaryDirectory(prefix=f"up_{item_id[:16]}_") as tmp:
         den_dir  = os.path.join(tmp,"denoised")
         up_dir   = os.path.join(tmp,"upscaled")
         audio    = os.path.join(tmp,"audio.mka")
         os.makedirs(den_dir); os.makedirs(up_dir)
-        start_frame = ckpt["last_frame"]
 
         # 1. Extract audio
         subprocess.run(["ffmpeg","-y","-i",input_path,"-vn","-c:a","copy","-c:s","copy",audio],
