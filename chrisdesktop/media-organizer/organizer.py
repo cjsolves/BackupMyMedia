@@ -35,6 +35,7 @@ import threading
 from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import lookup
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -49,6 +50,10 @@ log = logging.getLogger("organizer")
 # ---------------------------------------------------------------------------
 # Configuration (from environment variables with sensible defaults)
 # ---------------------------------------------------------------------------
+TMDB_API_KEY      = os.environ.get("TMDB_API_KEY", "")
+OPENSUBS_API_KEY  = os.environ.get("OPENSUBS_API_KEY", "")
+NEEDS_REVIEW      = os.environ.get("NEEDS_REVIEW",      "/media/needs-review")
+
 INBOX_COMPLETED   = os.environ.get("INBOX_COMPLETED",   "/media/inbox/completed")
 INBOX_MUSIC       = os.environ.get("INBOX_MUSIC",       "/media/inbox/music")
 LOSSLESS_MOVIES   = os.environ.get("LOSSLESS_MOVIES",   "/media/lossless/Movies")
@@ -127,6 +132,32 @@ def wait_until_stable(folder: Path) -> bool:
     return False
 
 
+def verify_and_rename(folder: Path, is_tv: bool) -> Path | None:
+    """
+    Try all identification strategies (GuessIt → NFO → MKV meta → OpenSubs → TMDb).
+    Renames the folder to the canonical 'Title (Year)' and returns the new path.
+    Returns None if the content cannot be identified — caller should route to NEEDS_REVIEW.
+    """
+    if not TMDB_API_KEY:
+        return folder  # no API key — pass through unchanged
+
+    canonical = lookup.identify_folder(folder, is_tv, TMDB_API_KEY, OPENSUBS_API_KEY)
+
+    if canonical is None:
+        return None  # completely unidentified
+
+    if canonical == folder.name:
+        return folder
+
+    new_path = folder.parent / canonical
+    if new_path.exists():
+        log.warning(f"Canonical '{canonical}' already exists, keeping '{folder.name}'")
+        return folder
+
+    folder.rename(new_path)
+    return new_path
+
+
 def is_tv_show(folder: Path) -> bool:
     """
     Return True if folder contains at least one immediate subdirectory whose
@@ -198,6 +229,13 @@ def handle_completed(folder: Path) -> None:
             dest = Path(LOSSLESS_MOVIES)
             label = "Movie"
 
+        renamed = verify_and_rename(folder, is_tv=(label == "TV"))
+        if renamed is None:
+            # Could not identify — quarantine in Needs-Review for manual fix
+            log.warning(f"[UNIDENTIFIED] Moving to Needs-Review: {folder.name}")
+            move_to(folder, Path(NEEDS_REVIEW))
+            return
+        folder = renamed
         log.info(f"[{label}] {folder.name}")
         move_to(folder, dest)
 
@@ -295,13 +333,21 @@ def main() -> None:
     log.info(f"  LOSSLESS Movies   : {LOSSLESS_MOVIES}")
     log.info(f"  LOSSLESS TV       : {LOSSLESS_TV}")
     log.info(f"  LOSSLESS Music    : {LOSSLESS_MUSIC}")
+    log.info(f"  Needs-Review      : {NEEDS_REVIEW}")
     log.info(f"  Stability timeout : {STABILITY_SECONDS}s")
     log.info(f"  Max wait          : {MAX_WAIT_SECONDS}s")
+    log.info(f"  TMDb lookup       : {'enabled' if TMDB_API_KEY else 'DISABLED (no TMDB_API_KEY)'}")
+    log.info(f"  OpenSubs hash     : {'enabled' if OPENSUBS_API_KEY else 'disabled'}")
+    log.info("")
+    log.info("  DROP FOLDERS:")
+    log.info(f"    Re-process / rescue unidentified files  →  {INBOX_COMPLETED}")
+    log.info(f"    Files that still can't be identified    →  {NEEDS_REVIEW}  (fix manually then re-drop)")
 
     # Create all required directories
     for path_str in [
         INBOX_COMPLETED, INBOX_MUSIC,
         LOSSLESS_MOVIES, LOSSLESS_TV, LOSSLESS_MUSIC,
+        NEEDS_REVIEW,
     ]:
         Path(path_str).mkdir(parents=True, exist_ok=True)
 

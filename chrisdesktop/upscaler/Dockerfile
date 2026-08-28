@@ -4,7 +4,7 @@
 #  Lowest priority: pauses when ripping/transcoding is active
 # =============================================================================
 
-FROM nvidia/cuda:12.3.1-cudnn9-runtime-ubuntu22.04
+FROM nvidia/cuda:12.0.0-base-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -18,10 +18,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install PyTorch with CUDA support first (large download)
+# Pin torchvision to 0.15.x — newer versions removed functional_tensor used by basicsr
 RUN pip3 install --no-cache-dir \
-    torch torchvision \
-    --index-url https://download.pytorch.org/whl/cu121
+    torch==2.0.1 torchvision==0.15.2 \
+    --index-url https://download.pytorch.org/whl/cu118
 
 # Install remaining dependencies
 COPY requirements.txt .

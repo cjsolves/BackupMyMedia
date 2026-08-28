@@ -1,0 +1,54 @@
+# =============================================================================
+#  Upscale Node — Remote AI Upscaling Worker
+#
+#  Deploy this on a second machine to share the upscaling queue.
+#  Each movie is allocated exclusively to one node — never split across machines.
+#
+#  This node runs in REMOTE mode:
+#    - Polls the pipeline API for queued jobs  (no NAS mount needed)
+#    - Downloads the source MKV over HTTP
+#    - Upscales locally with Real-ESRGAN
+#    - Uploads the finished file back to the pipeline
+#
+#  See ADD-NODE.md for full setup instructions.
+# =============================================================================
+
+services:
+  upscaler:
+    build: ../chrisdesktop/upscaler
+    container_name: media-upscaler-node2
+    restart: unless-stopped
+    environment:
+      - NODE_ID=${NODE_ID:-node2}
+      - PIPELINE_MODE=remote
+      - PIPELINE_API=${PIPELINE_API}            # required — set in .env
+      - UPSCALER_STAGING=/data/upscale-queue    # local download cache
+      - UPSCALER_OUTPUT=/data/upscale-output    # local encode output (deleted after upload)
+      - UPSCALER_CHECKPOINTS=/data/upscale-checkpoints
+      - TARGET_HEIGHT=${TARGET_HEIGHT:-1080}
+      - UPSCALE_MODEL=${UPSCALE_MODEL:-RealESRGAN_x4plus}
+      - DENOISE_STRENGTH=${DENOISE_STRENGTH:-3}
+      - AUDIO_CLEANUP=${AUDIO_CLEANUP:-true}
+      - AUDIO_NOISE_FLOOR=${AUDIO_NOISE_FLOOR:--25}
+      - USE_GPU=${USE_GPU:-true}
+      - PARALLEL_JOBS=${PARALLEL_JOBS:-1}
+      - POLL_INTERVAL=30
+      - CHECKPOINT_INTERVAL=150
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - upscaler_checkpoints:/data/upscale-checkpoints  # survives restarts
+      - upscaler_queue:/data/upscale-queue
+      - upscaler_output:/data/upscale-output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]
+
+volumes:
+  upscaler_checkpoints:
+  upscaler_queue:
+  upscaler_output:

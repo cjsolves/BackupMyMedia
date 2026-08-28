@@ -55,6 +55,10 @@ CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "150"))
 PARALLEL_JOBS       = int(os.environ.get("PARALLEL_JOBS",     "1"))
 USE_GPU             = os.environ.get("USE_GPU", "true").lower() == "true"
 SCALE_FACTOR        = int(os.environ.get("SCALE_FACTOR",      "4"))
+NODE_ID             = os.environ.get("NODE_ID",               "local")
+# local: read source files directly from the NAS mount (low overhead, default)
+# remote: download source from pipeline HTTP API, upload result when done
+PIPELINE_MODE       = os.environ.get("PIPELINE_MODE",         "local")
 
 # Model selection — environment variable UPSCALE_MODEL controls quality vs speed:
 #   RealESRGAN_x4plus        - fast, good quality (~2h for a 90min 480p film on RTX 3080)
@@ -233,10 +237,11 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
     ckpt = load_ckpt(item_id) or {
         "item_id":item_id,"input_path":input_path,"output_path":output_path,
         "started_at":datetime.now(timezone.utc).isoformat(),
-        "total_frames":frame_count(input_path),"last_frame":0,"status":"in_progress",
+        "total_frames":frame_count(input_path),"last_frame":0,"fps_str":fps_str,"status":"in_progress",
     }
     save_ckpt(item_id, ckpt)
-    _api(item_id, "processing", {"step":"starting","pct":0})
+    resume_pct = int(100 * ckpt["last_frame"] / max(ckpt["total_frames"], 1))
+    _api(item_id, "processing", {"step":"resuming" if ckpt["last_frame"] > 0 else "starting", "pct": resume_pct})
 
     with tempfile.TemporaryDirectory(prefix=f"up_{item_id[:16]}_") as tmp:
         den_dir  = os.path.join(tmp,"denoised")
@@ -252,12 +257,20 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
         # 2. Extract + denoise frames
         denoise_vf = (f"hqdn3d={DENOISE_STRENGTH:.1f}:{DENOISE_STRENGTH*0.75:.1f}:"
                       f"{DENOISE_STRENGTH*4:.1f}:{DENOISE_STRENGTH*3:.1f}")
-        sel_and_denoise = f"select='gte(n\\,{start_frame})',{denoise_vf}" if DENOISE_STRENGTH > 0 \
-                          else f"select='gte(n\\,{start_frame})'"
         log.info(f"[{item_id}] Extracting frames from {start_frame} (with pre-denoise)...")
-        subprocess.run(["ffmpeg","-y","-i",input_path,"-vf",sel_and_denoise,
-                        "-vsync","0","-start_number",str(start_frame),"-q:v","1",
-                        os.path.join(den_dir,"f%08d.png")], capture_output=True)
+        extract_cmd = ["ffmpeg", "-y"]
+        if start_frame > 0:
+            # Fast input-side seek — jumps to keyframe near target without decoding all prior frames
+            saved_fps = ckpt.get("fps_str") or fps_str
+            _n, _d = (saved_fps.split("/") + ["1"])[:2]
+            seek_ts = start_frame / (int(_n) / max(int(_d), 1))
+            extract_cmd += ["-ss", f"{seek_ts:.3f}"]
+        extract_cmd += ["-i", input_path]
+        if DENOISE_STRENGTH > 0:
+            extract_cmd += ["-vf", denoise_vf]
+        extract_cmd += ["-vsync", "0", "-start_number", str(start_frame), "-q:v", "1",
+                        os.path.join(den_dir, "f%08d.png")]
+        subprocess.run(extract_cmd, capture_output=True)
 
         frames = sorted(Path(den_dir).glob("f*.png"))
         log.info(f"[{item_id}] {len(frames)} frames to upscale")
@@ -265,6 +278,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
         # 3. Real-ESRGAN per-frame
         if frames:
             model = get_esrgan()
+            last_hb = time.time()
             for i, fp in enumerate(frames):
                 if _shutdown:
                     ckpt["last_frame"] = start_frame + i
@@ -277,6 +291,11 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
                     pct = int(100*(start_frame+i)/max(ckpt["total_frames"],1))
                     log.info(f"[{item_id}] {start_frame+i}/{ckpt['total_frames']} frames ({pct}%)")
                     _api(item_id,"processing",{"step":"upscaling","pct":pct})
+                    last_hb = time.time()
+                elif time.time() - last_hb >= 60:
+                    pct = int(100*(start_frame+i)/max(ckpt["total_frames"],1))
+                    _api(item_id,"processing",{"step":"upscaling","pct":pct})
+                    last_hb = time.time()
                 img = cv2.imread(str(fp), cv2.IMREAD_UNCHANGED)
                 if img is None:
                     shutil.copy(fp, os.path.join(up_dir, fp.name)); continue
@@ -330,41 +349,123 @@ def run_job(item_id: str, input_path: str) -> bool:
     _api(item_id,"processing",{"step":"starting"})
     success = upscale_video(item_id, input_path, output_path)
     if success:
-        try:
-            httpx.post(f"{PIPELINE_API}/api/items/{item_id}/upscale_complete",
-                       json={"upscaled_path":output_path},timeout=10)
-        except Exception as e: log.warning(f"[{item_id}] Notify complete failed: {e}")
+        if PIPELINE_MODE == "remote":
+            success = _upload_result(item_id, output_path)
+            shutil.rmtree(os.path.join(STAGING_DIR, item_id), ignore_errors=True)
+        else:
+            try:
+                httpx.post(f"{PIPELINE_API}/api/items/{item_id}/upscale_complete",
+                           json={"upscaled_path":output_path},timeout=10)
+            except Exception as e: log.warning(f"[{item_id}] Notify complete failed: {e}")
         del_ckpt(item_id)
-        staging = os.path.join(STAGING_DIR, item_id)
-        if os.path.exists(staging): shutil.rmtree(staging, ignore_errors=True)
+        if PIPELINE_MODE == "local":
+            staging = os.path.join(STAGING_DIR, item_id)
+            if os.path.exists(staging): shutil.rmtree(staging, ignore_errors=True)
     elif _shutdown:
         log.info(f"[{item_id}] Checkpoint saved — will resume on restart")
     else:
         _api(item_id,"failed",{"error":"upscale_video returned False"})
     return success
 
-def find_next(max_n: int) -> list[tuple[str,str]]:
-    results = []
+
+def _download_source(item_id: str, local_dir: str) -> str | None:
+    """Stream source MKV from pipeline to local_dir. Returns local path or None."""
+    os.makedirs(local_dir, exist_ok=True)
+    try:
+        with httpx.stream("GET", f"{PIPELINE_API}/api/upscale/{item_id}/source",
+                          timeout=None, follow_redirects=True) as r:
+            if r.status_code != 200:
+                log.error(f"[{item_id}] Source download HTTP {r.status_code}")
+                return None
+            cd = r.headers.get("content-disposition", "")
+            fname = cd.split("filename=")[-1].strip('"') if "filename=" in cd else f"{item_id}.mkv"
+            local_path = os.path.join(local_dir, fname)
+            total = int(r.headers.get("content-length", 0))
+            done = 0
+            with open(local_path, "wb") as f:
+                for chunk in r.iter_bytes(chunk_size=8 * 1024 * 1024):
+                    f.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        log.info(f"[{item_id}] Downloading: {int(100*done/total)}%")
+        return local_path
+    except Exception as e:
+        log.error(f"[{item_id}] Download failed: {e}")
+        return None
+
+
+def _upload_result(item_id: str, result_path: str) -> bool:
+    """Upload completed MKV to pipeline. Returns True on success."""
+    fname = os.path.basename(result_path)
+    size_mb = os.path.getsize(result_path) // 1024 // 1024
+    log.info(f"[{item_id}] Uploading result ({size_mb} MB) → pipeline...")
+    try:
+        with open(result_path, "rb") as f:
+            r = httpx.post(
+                f"{PIPELINE_API}/api/upscale/{item_id}/result",
+                content=f,
+                headers={"Content-Type": "video/x-matroska", "X-Filename": fname},
+                timeout=None,
+            )
+        if r.status_code == 200:
+            log.info(f"[{item_id}] Upload complete")
+            return True
+        log.error(f"[{item_id}] Upload failed: {r.status_code}")
+        return False
+    except Exception as e:
+        log.error(f"[{item_id}] Upload error: {e}")
+        return False
+
+
+def claim_next() -> tuple[str, str] | None:
+    """Claim the next job. Resumes checkpoints first, then polls the pipeline API."""
+    # Resume in-progress checkpoints without re-claiming (already owned in DB)
     if os.path.isdir(CHECKPOINT_DIR):
         for cf in sorted(Path(CHECKPOINT_DIR).glob("*.json")):
-            if len(results) >= max_n: break
             try:
                 ck = json.load(open(cf))
-                if ck.get("status")=="in_progress" and os.path.exists(ck.get("input_path","")):
-                    results.append((ck["item_id"], ck["input_path"]))
+                if ck.get("status") == "in_progress" and os.path.exists(ck.get("input_path", "")):
+                    return ck["item_id"], ck["input_path"]
             except Exception: continue
-    if os.path.isdir(STAGING_DIR):
-        for e in sorted(os.scandir(STAGING_DIR), key=lambda x: x.name):
-            if len(results) >= max_n: break
-            if not e.is_dir(): continue
-            if any(r[0]==e.name for r in results): continue
-            mkvs = sorted(Path(e.path).glob("**/*.mkv"),key=lambda p:p.stat().st_size,reverse=True)
-            if mkvs: results.append((e.name, str(mkvs[0])))
-    return results
+
+    # Claim new job from pipeline
+    try:
+        r = httpx.post(f"{PIPELINE_API}/api/upscale/claim",
+                       json={"node_id": NODE_ID}, timeout=10)
+        if r.status_code == 204:
+            return None
+        item = r.json()
+    except Exception as e:
+        log.warning(f"Claim failed: {e}")
+        return None
+
+    item_id = item.get("id")
+    if not item_id:
+        return None
+
+    if PIPELINE_MODE == "remote":
+        local_dir = os.path.join(STAGING_DIR, item_id)
+        src = _download_source(item_id, local_dir)
+        if not src:
+            log.error(f"[{item_id}] Source download failed — skipping")
+            return None
+        return item_id, src
+    else:
+        # Local mode: find MKV directly on the mounted NAS lossless path
+        lossless = item.get("nas_lossless_path", "")
+        if not lossless or not os.path.isdir(lossless):
+            log.warning(f"[{item_id}] NAS lossless path not accessible: {lossless}")
+            return None
+        mkvs = sorted(Path(lossless).glob("**/*.mkv"),
+                      key=lambda p: p.stat().st_size, reverse=True)
+        if not mkvs:
+            log.warning(f"[{item_id}] No MKV at {lossless}")
+            return None
+        return item_id, str(mkvs[0])
 
 def main():
     log.info("=== High-Quality AI Video Upscaler ===")
-    log.info(f"  Model={MODEL_NAME} | Scale={SCALE_FACTOR}x -> {TARGET_HEIGHT}p | Denoise={DENOISE_STRENGTH}")
+    log.info(f"  Node={NODE_ID} | Mode={PIPELINE_MODE} | Model={MODEL_NAME} | Scale={SCALE_FACTOR}x -> {TARGET_HEIGHT}p | Denoise={DENOISE_STRENGTH}")
     log.info(f"  GPU={USE_GPU} | Parallel={PARALLEL_JOBS} | Checkpoint every {CHECKPOINT_INTERVAL} frames")
     log.info(f"  Quality: CRF 16 H.265, unsharp post-process, FP16 GPU inference")
     for d in (STAGING_DIR,OUTPUT_DIR,CHECKPOINT_DIR): os.makedirs(d,exist_ok=True)
@@ -377,13 +478,17 @@ def main():
                 log.info(f"Pipeline busy — {len(active)} job(s) running (will yield at next checkpoint)")
                 time.sleep(POLL_INTERVAL); continue
             slots = PARALLEL_JOBS - len(active)
-            if slots > 0:
-                candidates = find_next(PARALLEL_JOBS + len(active))
-                new = [(iid,p) for iid,p in candidates if iid not in active][:slots]
-                for item_id,input_path in new:
-                    log.info(f"Starting job: {item_id}")
+            while slots > 0:
+                result = claim_next()
+                if not result:
+                    break
+                item_id, input_path = result
+                if item_id not in active:
+                    log.info(f"[{NODE_ID}] Starting job: {item_id}")
                     active[item_id] = pool.submit(run_job, item_id, input_path)
-            if not active and not find_next(1): log.debug("Queue empty")
+                    slots -= 1
+            if not active:
+                log.debug("Queue empty")
             time.sleep(POLL_INTERVAL)
         log.info(f"Shutdown: waiting for {len(active)} job(s) to save checkpoints...")
         for fut in active.values():

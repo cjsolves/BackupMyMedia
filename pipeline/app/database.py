@@ -3,6 +3,11 @@ import aiosqlite
 from app.config import settings
 
 DB = settings.DB_PATH
+_TIMEOUT = 10  # seconds to wait on a locked DB before raising
+
+
+def _connect():
+    return aiosqlite.connect(DB, timeout=_TIMEOUT)
 
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS items (
@@ -28,7 +33,8 @@ CREATE TABLE IF NOT EXISTS items (
     original_width     INTEGER DEFAULT 0,
     original_height    INTEGER DEFAULT 0,
     upscale_started_at TEXT,
-    upscale_completed_at TEXT
+    upscale_completed_at TEXT,
+    upscale_node       TEXT DEFAULT NULL   -- which node owns this job (null = unclaimed)
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -47,6 +53,7 @@ ALTER TABLE items ADD COLUMN original_width INTEGER DEFAULT 0;
 ALTER TABLE items ADD COLUMN original_height INTEGER DEFAULT 0;
 ALTER TABLE items ADD COLUMN upscale_started_at TEXT;
 ALTER TABLE items ADD COLUMN upscale_completed_at TEXT;
+ALTER TABLE items ADD COLUMN upscale_node TEXT DEFAULT NULL;
 """
 
 # Valid pipeline states in order
@@ -77,7 +84,9 @@ PROBLEM_CODES = {
 
 
 async def init_db():
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
         await db.executescript(CREATE_SQL)
         # Add upscale columns to existing databases (migration)
         existing_cols = {row[1] async for row in await db.execute("PRAGMA table_info(items)")}
@@ -96,7 +105,7 @@ async def init_db():
 
 async def upsert_item(item: dict):
     item["updated_at"] = "datetime('now')"
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         cols = ", ".join(item.keys())
         placeholders = ", ".join("?" for _ in item)
         updates = ", ".join(f"{k}=excluded.{k}" for k in item if k != "id")
@@ -109,7 +118,7 @@ async def upsert_item(item: dict):
 
 
 async def set_state(item_id: str, state: str, detail: str = ""):
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         await db.execute(
             "UPDATE items SET state=?, updated_at=datetime('now') WHERE id=?",
             (state, item_id),
@@ -122,7 +131,7 @@ async def set_state(item_id: str, state: str, detail: str = ""):
 
 
 async def set_problem(item_id: str, code: str, detail: str = ""):
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         await db.execute(
             "UPDATE items SET state='problem', problem=?, problem_detail=?, updated_at=datetime('now') WHERE id=?",
             (code, detail or PROBLEM_CODES.get(code, ""), item_id),
@@ -135,7 +144,7 @@ async def set_problem(item_id: str, code: str, detail: str = ""):
 
 
 async def clear_problem(item_id: str, new_state: str):
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         await db.execute(
             "UPDATE items SET state=?, problem=NULL, problem_detail=NULL, updated_at=datetime('now') WHERE id=?",
             (new_state, item_id),
@@ -144,7 +153,7 @@ async def clear_problem(item_id: str, new_state: str):
 
 
 async def log_event(item_id: str, event: str, detail: str = ""):
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         await db.execute(
             "INSERT INTO events (item_id, event, detail) VALUES (?,?,?)",
             (item_id, event, detail),
@@ -153,7 +162,7 @@ async def log_event(item_id: str, event: str, detail: str = ""):
 
 
 async def get_all_items() -> list[dict]:
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT * FROM items ORDER BY updated_at DESC"
@@ -162,7 +171,7 @@ async def get_all_items() -> list[dict]:
 
 
 async def get_recent_events(limit: int = 50) -> list[dict]:
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT e.*, i.title FROM events e "
@@ -174,8 +183,33 @@ async def get_recent_events(limit: int = 50) -> list[dict]:
 
 
 async def get_item(item_id: str) -> dict | None:
-    async with aiosqlite.connect(DB) as db:
+    async with _connect() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM items WHERE id=?", (item_id,))
         row = await cur.fetchone()
         return dict(row) if row else None
+
+
+async def claim_upscale_job(node_id: str) -> dict | None:
+    """Atomically claim the next unclaimed queued upscale job for a node."""
+    item_id = None
+    async with _connect() as conn:
+        cur = await conn.execute(
+            "SELECT id FROM items WHERE upscale_status='queued' AND upscale_node IS NULL "
+            "ORDER BY created_at LIMIT 1"
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        item_id = row[0]
+        # Atomic update — WHERE condition prevents double-claim in concurrent requests
+        await conn.execute(
+            "UPDATE items SET upscale_node=?, upscale_status='processing', "
+            "upscale_started_at=datetime('now'), updated_at=datetime('now') "
+            "WHERE id=? AND upscale_node IS NULL",
+            (node_id, item_id),
+        )
+        await conn.commit()
+    item = await get_item(item_id)
+    return item if item and item.get("upscale_node") == node_id else None
+

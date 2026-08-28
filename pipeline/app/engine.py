@@ -20,6 +20,17 @@ UPSCALE_OUTPUT  = os.environ.get("PATH_UPSCALE_OUTPUT",  "/media/upscale-output"
 LOSSLESS_ROOT   = settings.PATH_NAS_LOSSLESS
 
 
+def find_main_mkv(lossless_path: str) -> str | None:
+    """Return the largest MKV under a lossless folder, or None."""
+    if not lossless_path or not os.path.isdir(lossless_path):
+        return None
+    files = [(os.path.getsize(fp), fp)
+             for root, _, fs in os.walk(lossless_path)
+             for f in fs
+             if (fp := os.path.join(root, f)).lower().endswith(".mkv")]
+    return sorted(files, reverse=True)[0][1] if files else None
+
+
 # ---------------------------------------------------------------------------
 # File mover: Mini PC completed → NAS Lossless
 # ---------------------------------------------------------------------------
@@ -112,8 +123,88 @@ def _nas_reachable(path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Stuck job detector
+# Post-completion local cleanup
 # ---------------------------------------------------------------------------
+
+async def cleanup_completed_local():
+    """
+    Delete local Lossless and Plex copies after a full pipeline run.
+    Only fires when state=='complete', both NAS paths exist on disk, and
+    AUTO_CLEANUP_LOCAL is true. Runs AFTER Plex has already been refreshed.
+    """
+    if not settings.AUTO_CLEANUP_LOCAL:
+        return
+
+    local_lossless = settings.PATH_LOCAL_LOSSLESS
+    local_plex     = settings.PATH_LOCAL_PLEX
+
+    # Silently skip if local volumes are not mounted in this container
+    if not os.path.isdir(local_lossless) or not os.path.isdir(local_plex):
+        return
+
+    items = await db.get_all_items()
+    for item in items:
+        if item["state"] != "complete":
+            continue
+
+        nas_lossless = item.get("nas_lossless_path")
+        nas_plex     = item.get("nas_plex_path")
+
+        # Both NAS copies must be confirmed reachable before we delete locally
+        if not (nas_lossless and nas_plex):
+            continue
+        if not (os.path.isdir(nas_lossless) and os.path.isdir(nas_plex)):
+            continue
+
+        item_id = item["id"]
+        media   = item.get("media_type", "unknown")
+        subdir  = {"movie": "Movies", "tv": "TV", "music": "Music"}.get(media, "Movies")
+
+        for base, label in ((local_lossless, "Lossless"), (local_plex, "Plex")):
+            local_path = os.path.join(base, subdir, item_id)
+            if os.path.isdir(local_path):
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, shutil.rmtree, local_path
+                    )
+                    log.info(f"[{item_id}] Deleted local {label}: {local_path}")
+                    await db.log_event(item_id, "local_cleanup", f"Deleted local {label} copy")
+                except Exception as e:
+                    log.warning(f"[{item_id}] Cleanup of local {label} failed: {e}")
+
+async def cleanup_lossless_after_transcode():
+    """
+    Delete D:\Lossless originals once Tdarr has produced a Plex version.
+    Does NOT require NAS — works purely on local D: storage.
+    Frees the bulk of D: space as items complete transcoding.
+    """
+    local_lossless = settings.PATH_LOCAL_LOSSLESS
+    local_plex     = settings.PATH_LOCAL_PLEX
+
+    if not os.path.isdir(local_lossless) or not os.path.isdir(local_plex):
+        return
+
+    items = await db.get_all_items()
+    for item in items:
+        if item["state"] != "complete":
+            continue
+
+        item_id = item["id"]
+        media  = item.get("media_type", "unknown")
+        subdir = {"movie": "Movies", "tv": "TV", "music": "Music"}.get(media, "Movies")
+
+        plex_path     = os.path.join(local_plex, subdir, item_id)
+        lossless_path = os.path.join(local_lossless, subdir, item_id)
+
+        # Only delete Lossless if the Plex version actually exists
+        if os.path.isdir(plex_path) and os.path.isdir(lossless_path):
+            try:
+                await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, lossless_path)
+                log.info(f"[{item_id}] Deleted Lossless original (Plex version confirmed)")
+                await db.log_event(item_id, "lossless_cleanup", "Deleted Lossless after transcode")
+            except Exception as e:
+                log.warning(f"[{item_id}] Lossless cleanup failed: {e}")
+
 
 async def detect_stuck_jobs():
     """Flag jobs that haven't progressed in too long."""
@@ -139,6 +230,22 @@ async def detect_stuck_jobs():
         elif state == "transcoding" and age_min > settings.STUCK_THRESHOLD_TRANSCODING:
             await db.set_problem(item["id"], "stuck_transcoding",
                                  f"Transcode has not progressed in {int(age_min)} minutes")
+
+        # Upscale track: reset dead node claims so another node can pick up the job
+        if item.get("upscale_status") == "processing":
+            started = _parse_dt(item.get("upscale_started_at"))
+            if started:
+                upscale_age_min = (now - started).total_seconds() / 60
+                if upscale_age_min > settings.STUCK_THRESHOLD_UPSCALING:
+                    node = item.get("upscale_node", "unknown")
+                    await db.upsert_item({
+                        "id": item["id"],
+                        "upscale_status": "queued",
+                        "upscale_node": None,
+                        "upscale_pct": 0,
+                    })
+                    await db.log_event(item["id"], "upscale_reset",
+                                       f"Node '{node}' silent for >{int(upscale_age_min)}min — re-queued")
 
 
 def _parse_dt(s: str | None) -> datetime | None:
@@ -225,14 +332,7 @@ def get_video_resolution(file_path: str) -> tuple[int, int]:
 
 async def check_and_queue_upscale(item_id: str):
     """
-    Called after a file reaches 'on_nas_lossless'.
-    If the video is below 1080p, copies it to the upscale staging dir and
-    marks upscale_status='queued'.
-
-    IMPORTANT: This does NOT change the main pipeline state.
-    The item continues through on_nas_lossless -> queued_transcode -> transcoding -> complete
-    in parallel. When the upscale completes, it replaces the NAS Lossless copy and
-    signals Tdarr to re-transcode the upscaled version.
+    Checks resolution via ffprobe and classifies the item.
     """
     item = await db.get_item(item_id)
     if not item or item.get("media_type") == "music":
@@ -262,10 +362,6 @@ async def check_and_queue_upscale(item_id: str):
         None, get_video_resolution, main_mkv
     )
 
-    if height == 0:
-        log.warning(f"[{item_id}] Could not determine resolution — skipping upscale check")
-        return
-
     log.info(f"[{item_id}] Resolution: {width}x{height}")
 
     # Store original resolution regardless
@@ -282,26 +378,12 @@ async def check_and_queue_upscale(item_id: str):
         await db.upsert_item({"id": item_id, "upscale_status": "skipped"})
         return
 
-    # Below target: queue for AI upscaling as a PARALLEL background job
-    log.info(f"[{item_id}] {height}p < {threshold}p — queuing for parallel AI upscale (pipeline continues unblocked)")
-
-    staging_dst = os.path.join(UPSCALE_STAGING, item_id)
-    try:
-        os.makedirs(UPSCALE_STAGING, exist_ok=True)
-        if not os.path.exists(staging_dst):
-            shutil.copytree(lossless_path, staging_dst)
-    except Exception as e:
-        log.error(f"[{item_id}] Staging copy failed: {e}")
-        return
-
-    # Mark as queued in the UPSCALE TRACK only — main pipeline state is untouched
-    await db.upsert_item({
-        "id": item_id,
-        "upscale_status": "queued",
-    })
+    # Below threshold: mark as queued — any available node will claim via /api/upscale/claim
+    log.info(f"[{item_id}] {height}p < {threshold}p — queuing for AI upscale (pipeline continues unblocked)")
+    await db.upsert_item({"id": item_id, "upscale_status": "queued"})
     await db.log_event(
         item_id, "upscale_queued",
-        f"{width}x{height} → queued for AI upscale to 1080p. Main pipeline continues."
+        f"{width}x{height} → queued for AI upscale to {threshold}p. Main pipeline continues."
     )
 
 
@@ -328,9 +410,20 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
         upscaled_filename = os.path.basename(upscaled_path)
         dst = os.path.join(lossless_path, upscaled_filename)
         shutil.move(upscaled_path, dst)
-        log.info(f"[{item_id}] Replaced NAS Lossless with upscaled: {dst}")
+        log.info(f"[{item_id}] Placed upscaled file: {dst}")
     except Exception as e:
         return {"ok": False, "error": f"Failed to replace NAS copy: {e}"}
+
+    # Delete original MKV(s) — upscaled version supersedes them
+    for dirpath, _, files in os.walk(lossless_path):
+        for fname in files:
+            fpath = os.path.join(dirpath, fname)
+            if fpath != dst and fname.lower().endswith(".mkv"):
+                try:
+                    os.remove(fpath)
+                    log.info(f"[{item_id}] Deleted pre-upscale original: {fname}")
+                except Exception as e:
+                    log.warning(f"[{item_id}] Could not delete original {fname}: {e}")
 
     # Clean up staging copy
     staging = os.path.join(UPSCALE_STAGING, item_id)
@@ -359,12 +452,15 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
 async def check_all_for_upscale():
     """
     Scan all 'on_nas_lossless' items to see if any need upscaling.
-    Called periodically by the scheduler.
+    Sets upscale_status='queued'; nodes claim jobs via /api/upscale/claim.
     """
     items = await db.get_all_items()
     for item in items:
-        if item["state"] == "on_nas_lossless" and not item.get("problem"):
-            await check_and_queue_upscale(item["id"])
+        if item["state"] != "on_nas_lossless" or item.get("problem"):
+            continue
+        if item.get("upscale_status") in ("queued", "processing", "complete", "skipped"):
+            continue
+        await check_and_queue_upscale(item["id"])
 
 
 # ---------------------------------------------------------------------------

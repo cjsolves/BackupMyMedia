@@ -9,10 +9,11 @@ import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import aiofiles
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -49,7 +50,7 @@ async def _run_poll():
     await poller.scan_nas()
     await engine.detect_stuck_jobs()
     await engine.move_rip_complete_items()
-    await engine.check_all_for_upscale()   # queue SD content for AI upscaling
+    await engine.check_all_for_upscale()
 
     # Auto-refresh Plex if any items just completed transcoding
     items = await db.get_all_items()
@@ -57,6 +58,12 @@ async def _run_poll():
                       and i.get("nas_plex_path")]
     if newly_complete:
         await engine.trigger_plex_refresh()
+
+    # Delete local Lossless + Plex copies AFTER Plex refresh, once NAS is confirmed
+    await engine.cleanup_completed_local()
+
+    # Delete D:\Lossless originals once Plex version exists locally (no NAS needed)
+    await engine.cleanup_lossless_after_transcode()
 
     await broadcast("update", {"ts": datetime.now(timezone.utc).isoformat()})
 
@@ -200,6 +207,57 @@ async def api_delete_item(item_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Upscaler node API - job claiming and file transfer for multi-node upscaling
+# ---------------------------------------------------------------------------
+
+class ClaimRequest(BaseModel):
+    node_id: str
+
+
+@app.post("/api/upscale/claim")
+async def api_upscale_claim(body: ClaimRequest):
+    """Node calls this to atomically claim the next queued upscale job."""
+    item = await db.claim_upscale_job(body.node_id)
+    if not item:
+        from fastapi.responses import Response
+        return Response(status_code=204)
+    await broadcast("update", {"reason": "upscale_claimed", "item_id": item["id"], "node": body.node_id})
+    return item
+
+
+@app.get("/api/upscale/{item_id}/source")
+async def api_upscale_source(item_id: str):
+    """Stream the source MKV to a remote upscale node."""
+    item = await db.get_item(item_id)
+    if not item:
+        raise HTTPException(404, "Item not found")
+    mkv = engine.find_main_mkv(item.get("nas_lossless_path", ""))
+    if not mkv:
+        raise HTTPException(404, "Source MKV not found")
+    return FileResponse(mkv, media_type="video/x-matroska",
+                        filename=os.path.basename(mkv))
+
+
+@app.post("/api/upscale/{item_id}/result")
+async def api_upscale_result(item_id: str, request: Request):
+    """Receive an upscaled file from a remote node, save it, and promote to lossless."""
+    item = await db.get_item(item_id)
+    if not item:
+        raise HTTPException(404, "Item not found")
+    filename = request.headers.get("X-Filename", f"{item_id}_upscaled.mkv")
+    upload_dir = os.path.join(os.path.dirname(db.DB), "upscale-uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    tmp_path = os.path.join(upload_dir, filename)
+    async with aiofiles.open(tmp_path, "wb") as f:
+        async for chunk in request.stream():
+            await f.write(chunk)
+    result = await engine.promote_upscale_complete(item_id, tmp_path)
+    if result.get("ok"):
+        await broadcast("update", {"reason": "upscale_complete", "item_id": item_id})
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Upscaler API - called by the upscaler Docker service
 # ---------------------------------------------------------------------------
 
@@ -248,6 +306,20 @@ async def api_skip_upscale(item_id: str):
     """Mark an item to skip upscaling (e.g. user decides SD quality is fine)."""
     await db.set_state(item_id, "complete", "Upscaling skipped by user")
     await broadcast("update", {"reason": "skip_upscale", "item_id": item_id})
+    return {"ok": True}
+
+
+class MovedToNasRequest(BaseModel):
+    nas_plex_path: str
+
+
+@app.post("/api/items/{item_id}/moved_to_nas")
+async def api_moved_to_nas(item_id: str, body: MovedToNasRequest):
+    """Called by the Windows sync script after moving a file to NAS Plex."""
+    await db.upsert_item({"id": item_id, "nas_plex_path": body.nas_plex_path})
+    await db.set_state(item_id, "complete", f"Moved to NAS: {body.nas_plex_path}")
+    await db.log_event(item_id, "moved_to_nas", body.nas_plex_path)
+    await broadcast("update", {"reason": "moved_to_nas", "item_id": item_id})
     return {"ok": True}
 
 

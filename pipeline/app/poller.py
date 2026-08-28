@@ -174,7 +174,7 @@ async def scan_nas():
     all_items = {i["id"]: i for i in await db.get_all_items()}
 
     # --- Scan NAS Lossless ---
-    _scan_nas_directory(
+    await _scan_nas_directory(
         settings.PATH_NAS_LOSSLESS,
         all_items,
         "nas_lossless_path",
@@ -182,7 +182,7 @@ async def scan_nas():
     )
 
     # --- Scan NAS Plex ---
-    _scan_nas_directory(
+    await _scan_nas_directory(
         settings.PATH_NAS_PLEX,
         all_items,
         "nas_plex_path",
@@ -193,13 +193,10 @@ async def scan_nas():
     await _detect_minipc_orphans(all_items)
 
 
-def _scan_nas_directory(base_path: str, all_items: dict, path_field: str, target_state: str):
+async def _scan_nas_directory(base_path: str, all_items: dict, path_field: str, target_state: str):
     if not os.path.exists(base_path):
         log.warning(f"NAS path not reachable: {base_path}")
         return
-
-    import asyncio
-    loop = asyncio.get_event_loop()
 
     for subdir in ("Movies", "TV", "Music"):
         folder = os.path.join(base_path, subdir)
@@ -209,15 +206,19 @@ def _scan_nas_directory(base_path: str, all_items: dict, path_field: str, target
             if not entry.is_dir():
                 continue
             item_id = entry.name
-            size = _folder_size(entry.path)
 
             if item_id in all_items:
                 existing = all_items[item_id]
-                if existing["state"] not in ("complete",):
-                    loop.create_task(_advance_state(item_id, target_state, entry.path, path_field, size))
+                # Skip items already at or past target state with path already recorded
+                if existing["state"] == "complete":
+                    continue
+                if existing["state"] == target_state and existing.get(path_field) == entry.path:
+                    continue
+                size = _folder_size(entry.path)
+                await _advance_state(item_id, target_state, entry.path, path_field, size)
             else:
-                # New item on NAS not tracked → create record
-                loop.create_task(_register_nas_item(item_id, subdir, target_state, entry.path, path_field, size))
+                size = _folder_size(entry.path)
+                await _register_nas_item(item_id, subdir, target_state, entry.path, path_field, size)
 
 
 async def _advance_state(item_id, state, path, path_field, size):

@@ -36,27 +36,38 @@ services:
       # Machine hostnames/IPs
       # -----------------------------------------------------------------------
       ARM_URL: "http://MiniPC:8080"          # ARM web UI on the ripping Mini PC
-      TDARR_URL: "http://localhost:8266"      # Tdarr on this machine (Chrisdesktop)
+      TDARR_URL: "http://host.docker.internal:8266"  # Tdarr on host (Docker Desktop bridge)
 
       # -----------------------------------------------------------------------
       # File paths as seen INSIDE the container (mapped via volumes below)
       # -----------------------------------------------------------------------
       PATH_MINIPC_COMPLETED: "/media/minipc/completed"
       PATH_MINIPC_MUSIC:     "/media/minipc/music"
-      PATH_NAS_LOSSLESS:     "/media/nas/Lossless"
-      PATH_NAS_PLEX:         "/media/nas/Plex"
+      # PATH_NAS_PLEX = local D:\Plex so scan_nas marks items complete when Tdarr finishes
+      # A Windows scheduled task moves D:\Plex → P:\ (NAS) separately
+      PATH_NAS_LOSSLESS:     "/media/lossless"
+      PATH_NAS_PLEX:         "/media/plex"
       PATH_BULK_INTAKE:      "/media/bulk-intake"
       PATH_UPSCALE_STAGING:  "/media/upscale-queue"
       PATH_UPSCALE_OUTPUT:   "/media/upscale-output"
 
       # Resolution threshold: queue everything below this for AI upscaling
-      TARGET_UPSCALE_HEIGHT: "2160"
+      TARGET_UPSCALE_HEIGHT: "1080"
 
       # Plex integration: auto-refresh library after new content is transcoded
       # Get your token: https://support.plex.tv/articles/204059436/
       PLEX_HOST: "NAS"          # hostname or IP of the Plex server
       PLEX_PORT: "32400"
       PLEX_TOKEN: ""            # set your Plex token here
+
+      # TMDb API key for automatic title lookup/correction when ingesting files
+      # Free key at: https://www.themoviedb.org/settings/api
+      TMDB_API_KEY: "2a2653450165b75bb9bcf453ff1c7d04"
+
+      # Cleanup of D:\Lossless is handled by cleanup_lossless_after_transcode (no NAS needed)
+      AUTO_CLEANUP_LOCAL: "false"
+      PATH_LOCAL_LOSSLESS: "/media/lossless"
+      PATH_LOCAL_PLEX:     "/media/plex"
 
       # -----------------------------------------------------------------------
       # Tdarr library IDs for the Movies and TV libraries
@@ -81,9 +92,9 @@ services:
       # On Windows Docker Desktop, UNC paths work like this:
       - "//MiniPC/BackupOfMedia:/media/minipc"
 
-      # NAS shares
-      - "//NAS/Lossless:/media/nas/Lossless"
-      - "//NAS/Plex:/media/nas/Plex"
+      # Primary D: storage
+      - "D:/PlexMedia/Lossless:/media/lossless"
+      - "D:/PlexMedia/Plex:/media/plex"
 
       # Bulk intake — drop large libraries here for end-to-end processing
       # POST http://localhost:8090/api/bulk_intake/scan to process
@@ -93,8 +104,8 @@ services:
       - "D:/PlexMedia/UpscaleQueue:/media/upscale-queue"
       - "D:/PlexMedia/UpscaleOutput:/media/upscale-output"
 
-    # Tdarr is on the same machine - use host network so localhost:8266 works
-    network_mode: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   pipeline_db:

@@ -44,6 +44,8 @@ import re
 import shutil
 import logging
 from pathlib import Path
+from app import lookup
+from app.config import settings
 
 log = logging.getLogger("bulk_intake")
 
@@ -119,12 +121,17 @@ def scan_bulk_intake(
                 else:
                     dest_dir = os.path.join(dest_base, title)
             else:
-                # For movies, use "Title (Year)" folder if detectable
+                # For movies, resolve to 'Title (Year)' — confirm via TMDb if key set
                 m = re.search(r'(.+?)\s*[\(\[](19|20)\d{2}[\)\]]', title)
-                if m:
-                    clean = m.group(0)
+                raw_folder = m.group(0) if m else title
+                parsed_title, parsed_year = lookup.parse_title_year(raw_folder)
+                if settings.TMDB_API_KEY:
+                    result = lookup.lookup_movie(parsed_title, parsed_year, settings.TMDB_API_KEY)
+                    clean  = lookup.movie_folder_name(result) if result else raw_folder
+                    if result and clean != raw_folder:
+                        log.info(f"TMDb rename: '{raw_folder}' -> '{clean}'")
                 else:
-                    clean = title
+                    clean = raw_folder
                 dest_dir = os.path.join(dest_base, clean)
 
             result = {

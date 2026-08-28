@@ -34,6 +34,15 @@ class Settings(BaseSettings):
     PLEX_PORT: str  = "32400"
     PLEX_TOKEN: str = ""       # required for Plex auth — see support.plex.tv/articles/204059436
 
+    # TMDb API key for title lookup/correction (free at themoviedb.org/settings/api)
+    TMDB_API_KEY: str = ""
+
+    # Local paths mounted into pipeline container for post-completion cleanup
+    PATH_LOCAL_LOSSLESS: str  = "/media/local-lossless"
+    PATH_LOCAL_PLEX: str      = "/media/local-plex"
+    # Delete local copies once item is confirmed complete on NAS (both lossless + plex)
+    AUTO_CLEANUP_LOCAL: bool  = True
+
     DB_PATH: str = "/data/pipeline.db"
 
     class Config:

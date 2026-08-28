@@ -60,9 +60,16 @@ services:
       # Seconds without any file-size change before a folder is moved
       - STABILITY_SECONDS=60
       - POLL_INTERVAL=10
+      # TMDb API key for title lookup/correction (free at themoviedb.org/settings/api)
+      - TMDB_API_KEY=${TMDB_API_KEY:-}
+      # OpenSubtitles key for content-hash ID of GUID-named files (free at opensubtitles.com/consumers)
+      - OPENSUBS_API_KEY=${OPENSUBS_API_KEY:-}
+      - NEEDS_REVIEW=/media/needs-review
     volumes:
       - "D:/PlexMedia/Inbox:/media/inbox"
       - "D:/PlexMedia/Lossless:/media/lossless"
+      # Unidentifiable files land here — rename manually then re-drop in Inbox/completed
+      - "D:/PlexMedia/Needs-Review:/media/needs-review"
 
   # ---------------------------------------------------------------------------
   #  tdarr
@@ -119,9 +126,9 @@ services:
       - tdarr_server:/app/server
       - tdarr_configs:/app/configs
       - tdarr_logs:/app/logs
-      # Input: organised lossless library
+      # Input: lossless library on D:
       - "D:/PlexMedia/Lossless:/media/lossless"
-      # Output: Plex-ready H.265 library
+      # Output: Plex-ready H.265 on D: (pipeline detects completion here, Windows task syncs to NAS)
       - "D:/PlexMedia/Plex:/media/plex"
       # Scratch space for in-progress transcodes (use a fast SSD)
       - "D:/PlexMedia/Transcode-Temp:/temp"
@@ -165,13 +172,13 @@ services:
     restart: unless-stopped
     environment:
       - TZ=Europe/London
-      - PIPELINE_API=http://localhost:8090
+      - PIPELINE_API=http://host.docker.internal:8090
       - UPSCALER_STAGING=/media/upscale-queue
       - UPSCALER_OUTPUT=/media/upscale-output
       - UPSCALER_CHECKPOINTS=/data/upscale-checkpoints
       - SCALE_FACTOR=4
-      # Output resolution — 2160 = 4K UHD:
-      - TARGET_HEIGHT=2160
+      # Output resolution — 1080p keeps output files manageable on local storage
+      - TARGET_HEIGHT=1080
       # Model — RealESRGAN_x4plus is fast and solid at 4K.
       # Switch to HAT-L for SOTA quality (set UPSCALE_MODEL=HAT-L_SRx4_ImageNet-pretrain)
       - UPSCALE_MODEL=RealESRGAN_x4plus
@@ -185,14 +192,17 @@ services:
       - PARALLEL_JOBS=1
       - POLL_INTERVAL=30
       - CHECKPOINT_INTERVAL=150
+      - NODE_ID=local
+      - PIPELINE_MODE=local   # local=read NAS directly | remote=HTTP download/upload
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
     volumes:
       - upscaler_checkpoints:/data/upscale-checkpoints  # persistent checkpoints
-      - "D:/PlexMedia/UpscaleQueue:/media/upscale-queue"    # SD files queued for upscaling
+      - "D:/PlexMedia/UpscaleQueue:/media/upscale-queue"    # staging dir for remote downloads
       - "D:/PlexMedia/UpscaleOutput:/media/upscale-output"  # upscaled results
       - "D:/PlexMedia/Lossless:/media/lossless"             # to replace NAS copy
-    network_mode: host    # needs to call pipeline API on localhost:8090
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     deploy:
       resources:
         reservations:
@@ -201,8 +211,56 @@ services:
               count: all
               capabilities: [gpu, video]
 
+  # ---------------------------------------------------------------------------
+  #  upscaler-node2  (OPTIONAL — add a second machine to share upscaling load)
+  #
+  #  Run this service on a DIFFERENT machine by copying this block to a new
+  #  docker-compose.yml on that machine. It needs no NAS mount — it downloads
+  #  the source file from the pipeline API and uploads the result when done.
+  #
+  #  Requirements on the remote machine:
+  #    - Docker with NVIDIA GPU (or set USE_GPU=false for CPU-only)
+  #    - Network access to this machine on port 8090 (pipeline API)
+  #
+  #  To enable: uncomment this block, set PIPELINE_API to this machine's IP.
+  #  Each movie is allocated to exactly one node — never split across machines.
+  # ---------------------------------------------------------------------------
+  # upscaler-node2:
+  #   build: ./upscaler
+  #   container_name: media-upscaler-node2
+  #   restart: unless-stopped
+  #   environment:
+  #     - NODE_ID=node2
+  #     - PIPELINE_MODE=remote
+  #     - PIPELINE_API=http://<THIS_MACHINE_IP>:8090
+  #     - UPSCALER_STAGING=/data/upscale-queue
+  #     - UPSCALER_OUTPUT=/data/upscale-output
+  #     - UPSCALER_CHECKPOINTS=/data/upscale-checkpoints
+  #     - TARGET_HEIGHT=1080
+  #     - UPSCALE_MODEL=RealESRGAN_x4plus
+  #     - DENOISE_STRENGTH=3
+  #     - AUDIO_CLEANUP=true
+  #     - USE_GPU=true
+  #     - PARALLEL_JOBS=1
+  #     - POLL_INTERVAL=30
+  #     - CHECKPOINT_INTERVAL=150
+  #   volumes:
+  #     - node2_checkpoints:/data/upscale-checkpoints
+  #     - node2_queue:/data/upscale-queue
+  #     - node2_output:/data/upscale-output
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu, video]
+
 volumes:
   tdarr_server:
   tdarr_configs:
   tdarr_logs:
   upscaler_checkpoints:
+  # node2_checkpoints:
+  # node2_queue:
+  # node2_output:
