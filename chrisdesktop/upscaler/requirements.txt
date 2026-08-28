@@ -1,4 +1,4 @@
-httpx==0.27.2
+httpx==0.28.1
 basicsr==1.4.2
 realesrgan==0.3.0
 opencv-python-headless==4.10.0.84
