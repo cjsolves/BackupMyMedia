@@ -285,7 +285,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
                     save_ckpt(item_id, ckpt)
                     return False
                 if i > 0 and i % CHECKPOINT_INTERVAL == 0:
-                    wait_for_idle(item_id)
+                    # Save checkpoint but don't block — main loop handles priority via claim throttling
                     ckpt["last_frame"] = start_frame + i
                     save_ckpt(item_id, ckpt)
                     pct = int(100*(start_frame+i)/max(ckpt["total_frames"],1))
