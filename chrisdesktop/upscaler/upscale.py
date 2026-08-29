@@ -171,13 +171,23 @@ def is_nonzero_file(path: str) -> bool:
     return os.path.isfile(path) and os.path.getsize(path) > 0
 
 
-def frame_count_on_disk(frame_dir: str) -> int:
-    highest = -1
+def contiguous_frame_count(frame_dir: str) -> int:
+    present = set()
     for fp in Path(frame_dir).glob("f*.png"):
         stem = fp.stem[1:]
-        if stem.isdigit():
-            highest = max(highest, int(stem))
-    return highest + 1
+        if stem.isdigit() and fp.is_file() and fp.stat().st_size > 0:
+            present.add(int(stem))
+    count = 0
+    while count in present:
+        count += 1
+    return count
+
+
+def valid_video_file(path: str) -> bool:
+    if not is_nonzero_file(path):
+        return False
+    info = probe_video(path)
+    return bool(info.get("width") and info.get("height"))
 
 
 def cleanup_item_cache(item_id: str, output_path: str):
@@ -323,13 +333,15 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> dict:
         "started_at":datetime.now(timezone.utc).isoformat(),
         "total_frames":frame_count(input_path),"last_frame":0,"fps_str":fps_str,"status":"in_progress",
     }
+    if ckpt["total_frames"] <= 0:
+        return {"ok": False, "step": "probe", "error": f"Could not determine total frame count for {input_path}", "pct": 0}
     ckpt["input_path"] = input_path
     ckpt["output_path"] = output_path
     ckpt["model_name"] = model_name
     ckpt["model_scale"] = model_scale
     ckpt["target_scale"] = target_scale
     save_ckpt(item_id, ckpt)
-    current_done = frame_count_on_disk(paths["up_dir"])
+    current_done = contiguous_frame_count(paths["up_dir"])
     current_pct = int(100 * current_done / max(ckpt["total_frames"], 1))
     _api(item_id, "processing", {"step":"resuming" if current_done > 0 else "starting", "pct": current_pct})
 
@@ -344,7 +356,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> dict:
 
     denoise_vf = (f"hqdn3d={DENOISE_STRENGTH:.1f}:{DENOISE_STRENGTH*0.75:.1f}:"
                   f"{DENOISE_STRENGTH*4:.1f}:{DENOISE_STRENGTH*3:.1f}")
-    den_done = frame_count_on_disk(paths["den_dir"])
+    den_done = contiguous_frame_count(paths["den_dir"])
     if den_done < ckpt["total_frames"]:
         _api(item_id, "processing", {"step":"extracting", "pct": current_pct})
         log.info(f"[{item_id}] Extracting frames from {den_done} (with pre-denoise)...")
@@ -356,7 +368,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> dict:
             os.path.join(paths["den_dir"], "f%08d.png"),
         ]
         result = subprocess.run(extract_cmd, capture_output=True)
-        den_done = frame_count_on_disk(paths["den_dir"])
+        den_done = contiguous_frame_count(paths["den_dir"])
         if result.returncode != 0 or den_done < ckpt["total_frames"]:
             return {
                 "ok": False,
@@ -365,7 +377,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> dict:
                 "pct": current_pct,
             }
 
-    up_done = frame_count_on_disk(paths["up_dir"])
+    up_done = contiguous_frame_count(paths["up_dir"])
     if up_done < ckpt["total_frames"]:
         model = get_esrgan(model_name, model_scale)
         last_hb = time.time()
@@ -403,7 +415,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> dict:
 
     if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
         os.remove(output_path)
-    if not is_nonzero_file(output_path):
+    if not valid_video_file(output_path):
         _api(item_id, "processing", {"step":"reassembling", "pct": 99})
         audio_codec = "copy"
         audio_filter_args = []
@@ -428,11 +440,11 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> dict:
             output_path,
         ]
         result = subprocess.run(ffmpeg_cmd, capture_output=True)
-        if result.returncode != 0 or not is_nonzero_file(output_path):
+        if result.returncode != 0 or not valid_video_file(output_path):
             return {
                 "ok": False,
                 "step": "reassembling",
-                "error": ffmpeg_error(result) if result.returncode != 0 else f"Output invalid or zero bytes: {output_path}",
+                "error": ffmpeg_error(result) if result.returncode != 0 else f"Output invalid or unreadable: {output_path}",
                 "pct": 99,
             }
 
@@ -452,8 +464,11 @@ def run_job(item_id: str, input_path: str) -> bool:
     result = upscale_video(item_id, input_path, output_path)
     if result.get("ok"):
         promoted = False
+        promote_error = ""
         if PIPELINE_MODE == "remote":
-            promoted = _upload_result(item_id, output_path)
+            upload_result = _upload_result(item_id, output_path)
+            promoted = upload_result.get("ok", False)
+            promote_error = upload_result.get("error", "")
         else:
             try:
                 r = httpx.post(f"{PIPELINE_API}/api/items/{item_id}/upscale_complete",
@@ -461,16 +476,18 @@ def run_job(item_id: str, input_path: str) -> bool:
                 promoted = r.status_code == 200 and r.json().get("ok")
                 if not promoted:
                     err = r.text[:400]
-                    _api(item_id, "failed", {"step": "promoting", "pct": 99, "error": f"Promote failed: {err}"})
+                    promote_error = f"Promote failed: {err}"
             except Exception as e:
                 promoted = False
-                _api(item_id, "failed", {"step": "promoting", "pct": 99, "error": str(e)})
+                promote_error = str(e)
                 log.warning(f"[{item_id}] Notify complete failed: {e}")
         if promoted:
             del_ckpt(item_id)
             cleanup_item_cache(item_id, output_path)
             shutil.rmtree(os.path.join(STAGING_DIR, item_id), ignore_errors=True)
             return True
+        _api(item_id, "failed", {"step": "promoting", "pct": 99, "error": promote_error or "Promote/upload failed"})
+        log.error(f"[{item_id}] promoting failed: {promote_error or 'Promote/upload failed'}")
         return False
     elif result.get("shutdown") or _shutdown:
         log.info(f"[{item_id}] Checkpoint saved — will resume on restart")
@@ -506,8 +523,8 @@ def _download_source(item_id: str, local_dir: str) -> str | None:
         return None
 
 
-def _upload_result(item_id: str, result_path: str) -> bool:
-    """Upload completed MKV to pipeline. Returns True on success."""
+def _upload_result(item_id: str, result_path: str) -> dict:
+    """Upload completed MKV to pipeline. Returns {ok,error}."""
     fname = os.path.basename(result_path)
     size_mb = os.path.getsize(result_path) // 1024 // 1024
     log.info(f"[{item_id}] Uploading result ({size_mb} MB) → pipeline...")
@@ -521,12 +538,17 @@ def _upload_result(item_id: str, result_path: str) -> bool:
             )
         if r.status_code == 200:
             log.info(f"[{item_id}] Upload complete")
-            return True
-        log.error(f"[{item_id}] Upload failed: {r.status_code}")
-        return False
+            try:
+                data = r.json()
+            except Exception:
+                data = {"ok": True}
+            return {"ok": bool(data.get("ok", True)), "error": data.get("error", "")}
+        err = f"Upload failed: HTTP {r.status_code} {r.text[:400]}"
+        log.error(f"[{item_id}] {err}")
+        return {"ok": False, "error": err}
     except Exception as e:
         log.error(f"[{item_id}] Upload error: {e}")
-        return False
+        return {"ok": False, "error": str(e)}
 
 
 def _resolve_claimed_input(item: dict) -> str | None:
@@ -615,7 +637,8 @@ def claim_next(active_ids: set[str]) -> tuple[str, str] | None:
         return None
     src = _resolve_claimed_input(item)
     if not src:
-        log.error(f"[{item_id}] Source resolution failed — skipping")
+        _api(item_id, "failed", {"step": "source", "pct": 0, "error": "Source resolution failed"})
+        log.error(f"[{item_id}] Source resolution failed — marking failed")
         return None
     return item_id, src
 

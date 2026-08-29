@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app import database as db, engine, poller
 from app.config import settings
@@ -301,7 +301,7 @@ async def api_upscale_result(item_id: str, request: Request):
 
 class UpscaleStatusRequest(BaseModel):
     state: str
-    detail: dict = {}
+    detail: dict = Field(default_factory=dict)
 
 
 class UpscaleCompleteRequest(BaseModel):

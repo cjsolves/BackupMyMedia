@@ -500,7 +500,7 @@ async def trigger_plex_refresh():
     token_param = f"?X-Plex-Token={settings.PLEX_TOKEN}"
     try:
         # Get all library sections
-        r = await asyncio.get_event_loop().run_in_executor(
+        r = await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: __import__("httpx").get(f"{base}/library/sections{token_param}", timeout=8)
         )
