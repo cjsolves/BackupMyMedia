@@ -71,7 +71,7 @@ async def move_to_nas_lossless(item: dict):
 
     try:
         os.makedirs(dst_parent, exist_ok=True)
-        await asyncio.get_event_loop().run_in_executor(
+        await asyncio.get_running_loop().run_in_executor(
             None, _move_directory, src, dst
         )
         await db.upsert_item({"id": item_id, "nas_lossless_path": dst, "src_path": None})
@@ -164,7 +164,7 @@ async def cleanup_completed_local():
             local_path = os.path.join(base, subdir, item_id)
             if os.path.isdir(local_path):
                 try:
-                    await asyncio.get_event_loop().run_in_executor(
+                    await asyncio.get_running_loop().run_in_executor(
                         None, shutil.rmtree, local_path
                     )
                     log.info(f"[{item_id}] Deleted local {label}: {local_path}")
@@ -174,7 +174,7 @@ async def cleanup_completed_local():
 
 async def cleanup_lossless_after_transcode():
     """
-    Delete D:\Lossless originals once Tdarr has produced a Plex version.
+    Delete D:\\Lossless originals once Tdarr has produced a Plex version.
     Does NOT require NAS — works purely on local D: storage.
     Frees the bulk of D: space as items complete transcoding.
     """
@@ -199,7 +199,7 @@ async def cleanup_lossless_after_transcode():
         # Only delete Lossless if the Plex version actually exists
         if os.path.isdir(plex_path) and os.path.isdir(lossless_path):
             try:
-                await asyncio.get_event_loop().run_in_executor(None, shutil.rmtree, lossless_path)
+                await asyncio.get_running_loop().run_in_executor(None, shutil.rmtree, lossless_path)
                 log.info(f"[{item_id}] Deleted Lossless original (Plex version confirmed)")
                 await db.log_event(item_id, "lossless_cleanup", "Deleted Lossless after transcode")
             except Exception as e:
@@ -294,7 +294,7 @@ async def reclassify_item(item_id: str, new_title: str, new_year: str,
     After user provides the correct title, update the item and clear the problem.
     ARM's job won't be automatically updated - user must also fix it in ARM's UI.
     """
-    new_id = f"{new_title} ({new_year})" if new_year else new_title
+    new_id = f"{new_title} ({new_year})" if new_year else new_title  # noqa: F841 — ID change not implemented, kept for reference
     await db.upsert_item({
         "id": item_id,
         "title": new_title,
@@ -358,7 +358,7 @@ async def check_and_queue_upscale(item_id: str):
         return
 
     main_mkv = sorted(mkv_files, reverse=True)[0][1]
-    width, height = await asyncio.get_event_loop().run_in_executor(
+    width, height = await asyncio.get_running_loop().run_in_executor(
         None, get_video_resolution, main_mkv
     )
 
@@ -435,7 +435,8 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
         "id": item_id,
         "upscale_status": "complete",
         "upscale_pct": 100,
-        "upscale_completed_at": "datetime('now')",
+        "upscale_completed_at": datetime.now(timezone.utc).isoformat(),
+        "upscale_node": None,
     })
     await db.log_event(item_id, "upscale_complete",
                        "NAS Lossless replaced with 1080p upscaled version")

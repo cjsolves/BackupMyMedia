@@ -104,7 +104,6 @@ async def init_db():
 
 
 async def upsert_item(item: dict):
-    item["updated_at"] = "datetime('now')"
     async with _connect() as db:
         cols = ", ".join(item.keys())
         placeholders = ", ".join("?" for _ in item)

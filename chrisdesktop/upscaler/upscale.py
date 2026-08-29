@@ -424,10 +424,27 @@ def claim_next() -> tuple[str, str] | None:
     if os.path.isdir(CHECKPOINT_DIR):
         for cf in sorted(Path(CHECKPOINT_DIR).glob("*.json")):
             try:
-                ck = json.load(open(cf))
-                if ck.get("status") == "in_progress" and os.path.exists(ck.get("input_path", "")):
-                    return ck["item_id"], ck["input_path"]
-            except Exception: continue
+                with open(cf) as fh:
+                    ck = json.load(fh)
+            except Exception:
+                continue
+            if ck.get("status") != "in_progress" or not os.path.exists(ck.get("input_path", "")):
+                continue
+            item_id = ck["item_id"]
+            # Verify the DB still assigns this job to this node
+            # (detect_stuck_jobs may have reset it while we were offline)
+            try:
+                r = httpx.get(f"{PIPELINE_API}/api/items/{httpx.URL(item_id)}", timeout=5)
+                if r.status_code == 200:
+                    db_item = r.json()
+                    if db_item.get("upscale_node") != NODE_ID or db_item.get("upscale_status") != "processing":
+                        log.warning(f"[{item_id}] Stale checkpoint — DB shows node={db_item.get('upscale_node')} "
+                                    f"status={db_item.get('upscale_status')} — discarding")
+                        del_ckpt(item_id)
+                        continue
+            except Exception:
+                pass  # API unreachable — resume optimistically
+            return item_id, ck["input_path"]
 
     # Claim new job from pipeline
     try:

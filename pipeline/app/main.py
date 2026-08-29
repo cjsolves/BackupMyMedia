@@ -26,6 +26,8 @@ log = logging.getLogger("main")
 
 # SSE subscribers
 _sse_queues: list[asyncio.Queue] = []
+# Track complete item IDs across poll cycles so Plex refresh only fires for new completions
+_last_complete_ids: set[str] = set()
 
 
 async def broadcast(event: str, data: dict):
@@ -45,6 +47,7 @@ scheduler = AsyncIOScheduler()
 
 
 async def _run_poll():
+    global _last_complete_ids
     await poller.poll_arm()
     await poller.poll_tdarr()
     await poller.scan_nas()
@@ -52,19 +55,15 @@ async def _run_poll():
     await engine.move_rip_complete_items()
     await engine.check_all_for_upscale()
 
-    # Auto-refresh Plex if any items just completed transcoding
     items = await db.get_all_items()
-    newly_complete = [i for i in items if i["state"] == "complete"
-                      and i.get("nas_plex_path")]
-    if newly_complete:
+    # Only trigger Plex refresh when items newly reach complete state
+    complete_now = {i["id"] for i in items if i["state"] == "complete" and i.get("nas_plex_path")}
+    if complete_now - _last_complete_ids:
         await engine.trigger_plex_refresh()
+    _last_complete_ids = complete_now
 
-    # Delete local Lossless + Plex copies AFTER Plex refresh, once NAS is confirmed
     await engine.cleanup_completed_local()
-
-    # Delete D:\Lossless originals once Plex version exists locally (no NAS needed)
     await engine.cleanup_lossless_after_transcode()
-
     await broadcast("update", {"ts": datetime.now(timezone.utc).isoformat()})
 
 
@@ -135,6 +134,15 @@ async def sse_stream():
 @app.get("/api/summary")
 async def api_summary():
     return await _build_summary()
+
+
+@app.get("/api/items/{item_id}")
+async def api_get_item(item_id: str):
+    """Fetch a single pipeline item — used by upscaler nodes to verify checkpoint ownership."""
+    item = await db.get_item(item_id)
+    if not item:
+        raise HTTPException(404, "Item not found")
+    return item
 
 
 @app.get("/api/items")
@@ -245,13 +253,20 @@ async def api_upscale_result(item_id: str, request: Request):
     if not item:
         raise HTTPException(404, "Item not found")
     filename = request.headers.get("X-Filename", f"{item_id}_upscaled.mkv")
-    upload_dir = os.path.join(os.path.dirname(db.DB), "upscale-uploads")
+    # Per-item subfolder prevents filename collisions between concurrent remote nodes
+    upload_dir = os.path.join(os.path.dirname(db.DB), "upscale-uploads", item_id)
     os.makedirs(upload_dir, exist_ok=True)
     tmp_path = os.path.join(upload_dir, filename)
     async with aiofiles.open(tmp_path, "wb") as f:
         async for chunk in request.stream():
             await f.write(chunk)
     result = await engine.promote_upscale_complete(item_id, tmp_path)
+    # Clean up upload dir regardless of success or failure
+    try:
+        import shutil
+        shutil.rmtree(upload_dir, ignore_errors=True)
+    except Exception:
+        pass
     if result.get("ok"):
         await broadcast("update", {"reason": "upscale_complete", "item_id": item_id})
     return result
@@ -357,7 +372,7 @@ async def api_bulk_intake(body: BulkIntakeRequest = BulkIntakeRequest()):
     if not os.path.isdir(intake_path):
         return {"ok": False, "error": f"Bulk intake path not found: {intake_path}. Create D:\\PlexMedia\\BulkIngest\\"}
 
-    results = await asyncio.get_event_loop().run_in_executor(
+    results = await asyncio.get_running_loop().run_in_executor(
         None,
         scan_bulk_intake,
         intake_path,

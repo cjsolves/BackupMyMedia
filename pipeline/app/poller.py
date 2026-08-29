@@ -16,6 +16,9 @@ log = logging.getLogger("poller")
 
 ARM_HEADERS = {"Content-Type": "application/json"}
 
+# Precompute state ordering so the NAS scanner never regresses an item
+_STATE_RANK = {s: i for i, s in enumerate(db.STATES)}
+
 
 # ---------------------------------------------------------------------------
 # ARM poller
@@ -209,8 +212,14 @@ async def _scan_nas_directory(base_path: str, all_items: dict, path_field: str, 
 
             if item_id in all_items:
                 existing = all_items[item_id]
-                # Skip items already at or past target state with path already recorded
                 if existing["state"] == "complete":
+                    continue
+                # Never regress: if item is already past target state, only backfill the path if missing
+                curr_rank = _STATE_RANK.get(existing["state"], -1)
+                tgt_rank  = _STATE_RANK.get(target_state, -1)
+                if curr_rank > tgt_rank:
+                    if not existing.get(path_field):
+                        await db.upsert_item({"id": item_id, path_field: entry.path})
                     continue
                 if existing["state"] == target_state and existing.get(path_field) == entry.path:
                     continue
