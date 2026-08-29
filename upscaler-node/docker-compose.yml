@@ -26,7 +26,9 @@ services:
       - UPSCALER_OUTPUT=/data/upscale-output    # local encode output (deleted after upload)
       - UPSCALER_CHECKPOINTS=/data/upscale-checkpoints
       - TARGET_HEIGHT=${TARGET_HEIGHT:-1080}
-      - UPSCALE_MODEL=${UPSCALE_MODEL:-RealESRGAN_x4plus}
+      - UPSCALE_MODEL=${UPSCALE_MODEL:-auto}
+      - UPSCALE_TILE=${UPSCALE_TILE:-1024}
+      - UPSCALE_TILE_PAD=${UPSCALE_TILE_PAD:-16}
       - DENOISE_STRENGTH=${DENOISE_STRENGTH:-3}
       - AUDIO_CLEANUP=${AUDIO_CLEANUP:-true}
       - AUDIO_NOISE_FLOOR=${AUDIO_NOISE_FLOOR:--25}

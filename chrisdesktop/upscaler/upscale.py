@@ -54,19 +54,20 @@ POLL_INTERVAL       = int(os.environ.get("POLL_INTERVAL",     "30"))
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "150"))
 PARALLEL_JOBS       = int(os.environ.get("PARALLEL_JOBS",     "1"))
 USE_GPU             = os.environ.get("USE_GPU", "true").lower() == "true"
-SCALE_FACTOR        = int(os.environ.get("SCALE_FACTOR",      "4"))
 NODE_ID             = os.environ.get("NODE_ID",               "local")
 # local: read source files directly from the NAS mount (low overhead, default)
 # remote: download source from pipeline HTTP API, upload result when done
 PIPELINE_MODE       = os.environ.get("PIPELINE_MODE",         "local")
+UPSCALE_TILE        = int(os.environ.get("UPSCALE_TILE",      "0"))
+UPSCALE_TILE_PAD    = int(os.environ.get("UPSCALE_TILE_PAD",  "10"))
 
 # Model selection — environment variable UPSCALE_MODEL controls quality vs speed:
 #   RealESRGAN_x4plus        - fast, good quality (~2h for a 90min 480p film on RTX 3080)
 #   RealESRGAN_x4plus_anime_6B - fast, best for animation/cartoon
 #   HAT-L_SRx4_ImageNet-pretrain - SOTA quality (~8h for same film, 2-3x better detail)
 #   SwinIR-L_x4_GAN          - excellent quality, between ESRGAN and HAT in speed
-# Default: RealESRGAN_x4plus (practical balance of quality and time)
-MODEL_NAME          = os.environ.get("UPSCALE_MODEL",         "RealESRGAN_x4plus")
+# Default: auto = x2 when sufficient for target height, otherwise x4
+MODEL_NAME          = os.environ.get("UPSCALE_MODEL",         "auto")
 
 # Target output height — change for 2K or 4K output:
 #   1080  = Full HD  (1920x1080) — standard
@@ -194,28 +195,60 @@ def build_audio_filter() -> str:
         f"loudnorm=I=-23:TP=-2:LRA=7"                # EBU R128 target
     )
 
-_esrgan = None
+_esrgan_cache = {}
 
-def get_esrgan():
-    global _esrgan
-    if _esrgan: return _esrgan
+
+def required_scale(src_h: int) -> float:
+    return TARGET_HEIGHT / max(src_h, 1)
+
+
+def choose_model(src_h: int) -> tuple[str, int]:
+    if MODEL_NAME != "auto":
+        if "x2" in MODEL_NAME:
+            return MODEL_NAME, 2
+        return MODEL_NAME, 4
+    return ("RealESRGAN_x2plus", 2) if required_scale(src_h) <= 2.0 else ("RealESRGAN_x4plus", 4)
+
+
+def auto_tile_size(device: str, vram_gb: float) -> int:
+    if device != "cuda":
+        return 0
+    if UPSCALE_TILE > 0:
+        return UPSCALE_TILE
+    if vram_gb >= 10:
+        return 1024
+    if vram_gb >= 8:
+        return 768
+    if vram_gb >= 6:
+        return 512
+    if vram_gb >= 4:
+        return 256
+    return 128
+
+def get_esrgan(model_name: str, scale_factor: int):
+    cache_key = (model_name, scale_factor)
+    if cache_key in _esrgan_cache:
+        return _esrgan_cache[cache_key]
     import torch
     from basicsr.archs.rrdbnet_arch import RRDBNet
     from realesrgan import RealESRGANer
     device = "cuda" if (USE_GPU and torch.cuda.is_available()) else "cpu"
-    log.info(f"Loading {MODEL_NAME} on {device} | target={TARGET_HEIGHT}p | audio_cleanup={AUDIO_CLEANUP}")
-    nblk = 6 if "anime" in MODEL_NAME else 23
-    model = RRDBNet(num_in_ch=3,num_out_ch=3,num_feat=64,num_block=nblk,num_grow_ch=32,scale=SCALE_FACTOR)
-    tile = 0
+    nblk = 6 if "anime" in model_name else 23
+    vram = 0.0
     if device == "cuda":
         try:
-            vram = torch.cuda.get_device_properties(0).total_memory/1e9
-            tile = 512 if vram>=8 else 256 if vram>=4 else 128
-        except Exception: tile = 256
-    _esrgan = RealESRGANer(scale=SCALE_FACTOR,model_path=f"/models/{MODEL_NAME}.pth",
-                           model=model,tile=tile,tile_pad=10,pre_pad=0,
-                           half=(device=="cuda"),device=device)
-    log.info("Model ready"); return _esrgan
+            vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        except Exception:
+            vram = 0.0
+    tile = auto_tile_size(device, vram)
+    log.info(f"Loading {model_name} on {device} | target={TARGET_HEIGHT}p | tile={tile or 'full'} pad={UPSCALE_TILE_PAD} | audio_cleanup={AUDIO_CLEANUP}")
+    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=nblk, num_grow_ch=32, scale=scale_factor)
+    engine = RealESRGANer(scale=scale_factor, model_path=f"/models/{model_name}.pth",
+                          model=model, tile=tile, tile_pad=UPSCALE_TILE_PAD, pre_pad=0,
+                          half=(device=="cuda"), device=device)
+    _esrgan_cache[cache_key] = engine
+    log.info("Model ready")
+    return engine
 
 def _api(item_id, state, detail=None):
     try:
@@ -232,7 +265,9 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
         log.error(f"[{item_id}] Cannot probe {input_path}"); return False
 
     out_w, out_h = target_dims(src_w, src_h)
-    log.info(f"[{item_id}] {src_w}x{src_h} -> {out_w}x{out_h} | fps={fps_str} | denoise={DENOISE_STRENGTH}")
+    model_name, model_scale = choose_model(src_h)
+    target_scale = required_scale(src_h)
+    log.info(f"[{item_id}] {src_w}x{src_h} -> {out_w}x{out_h} | scale={target_scale:.2f}x | model={model_name} | fps={fps_str} | denoise={DENOISE_STRENGTH}")
 
     ckpt = load_ckpt(item_id) or {
         "item_id":item_id,"input_path":input_path,"output_path":output_path,
@@ -278,7 +313,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
 
         # 3. Real-ESRGAN per-frame
         if frames:
-            model = get_esrgan()
+            model = get_esrgan(model_name, model_scale)
             last_hb = time.time()
             for i, fp in enumerate(frames):
                 if _shutdown:
@@ -300,7 +335,7 @@ def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
                 img = cv2.imread(str(fp), cv2.IMREAD_UNCHANGED)
                 if img is None:
                     shutil.copy(fp, os.path.join(up_dir, fp.name)); continue
-                out_img, _ = model.enhance(img, outscale=SCALE_FACTOR)
+                out_img, _ = model.enhance(img, outscale=target_scale)
                 # Resize to exact target (ESRGAN output may differ by 1-2px)
                 if out_img.shape[1] != out_w or out_img.shape[0] != out_h:
                     out_img = cv2.resize(out_img,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
@@ -418,6 +453,24 @@ def _upload_result(item_id: str, result_path: str) -> bool:
         return False
 
 
+def _resolve_claimed_input(item: dict) -> str | None:
+    item_id = item.get("id")
+    if not item_id:
+        return None
+    if PIPELINE_MODE == "remote":
+        local_dir = os.path.join(STAGING_DIR, item_id)
+        return _download_source(item_id, local_dir)
+    lossless = item.get("nas_lossless_path", "")
+    if not lossless or not os.path.isdir(lossless):
+        log.warning(f"[{item_id}] NAS lossless path not accessible: {lossless}")
+        return None
+    mkvs = sorted(Path(lossless).glob("**/*.mkv"), key=lambda p: p.stat().st_size, reverse=True)
+    if not mkvs:
+        log.warning(f"[{item_id}] No MKV at {lossless}")
+        return None
+    return str(mkvs[0])
+
+
 def claim_next() -> tuple[str, str] | None:
     """Claim the next job. Resumes checkpoints first, then polls the pipeline API."""
     # Resume in-progress checkpoints without re-claiming (already owned in DB)
@@ -437,6 +490,14 @@ def claim_next() -> tuple[str, str] | None:
                 r = httpx.get(f"{PIPELINE_API}/api/items/{httpx.URL(item_id)}", timeout=5)
                 if r.status_code == 200:
                     db_item = r.json()
+                    if db_item.get("upscale_status") == "processing" and db_item.get("upscale_node") is None:
+                        adopt = httpx.post(
+                            f"{PIPELINE_API}/api/upscale/{httpx.URL(item_id)}/adopt",
+                            json={"node_id": NODE_ID}, timeout=5,
+                        )
+                        if adopt.status_code == 200:
+                            log.info(f"[{item_id}] Adopted legacy unowned checkpoint for node {NODE_ID}")
+                            return item_id, ck["input_path"]
                     if db_item.get("upscale_node") != NODE_ID or db_item.get("upscale_status") != "processing":
                         log.warning(f"[{item_id}] Stale checkpoint — DB shows node={db_item.get('upscale_node')} "
                                     f"status={db_item.get('upscale_status')} — discarding")
@@ -445,6 +506,18 @@ def claim_next() -> tuple[str, str] | None:
             except Exception:
                 pass  # API unreachable — resume optimistically
             return item_id, ck["input_path"]
+
+    # Recover our own claimed DB job even if restart happened before a checkpoint was usable
+    try:
+        r = httpx.get(f"{PIPELINE_API}/api/upscale/current/{NODE_ID}", timeout=5)
+        if r.status_code == 200:
+            item = r.json()
+            input_path = _resolve_claimed_input(item)
+            if input_path:
+                log.info(f"[{item['id']}] Resuming node-owned job without relying on checkpoint discovery")
+                return item["id"], input_path
+    except Exception:
+        pass
 
     # Claim new job from pipeline
     try:
@@ -460,30 +533,15 @@ def claim_next() -> tuple[str, str] | None:
     item_id = item.get("id")
     if not item_id:
         return None
-
-    if PIPELINE_MODE == "remote":
-        local_dir = os.path.join(STAGING_DIR, item_id)
-        src = _download_source(item_id, local_dir)
-        if not src:
-            log.error(f"[{item_id}] Source download failed — skipping")
-            return None
-        return item_id, src
-    else:
-        # Local mode: find MKV directly on the mounted NAS lossless path
-        lossless = item.get("nas_lossless_path", "")
-        if not lossless or not os.path.isdir(lossless):
-            log.warning(f"[{item_id}] NAS lossless path not accessible: {lossless}")
-            return None
-        mkvs = sorted(Path(lossless).glob("**/*.mkv"),
-                      key=lambda p: p.stat().st_size, reverse=True)
-        if not mkvs:
-            log.warning(f"[{item_id}] No MKV at {lossless}")
-            return None
-        return item_id, str(mkvs[0])
+    src = _resolve_claimed_input(item)
+    if not src:
+        log.error(f"[{item_id}] Source resolution failed — skipping")
+        return None
+    return item_id, src
 
 def main():
     log.info("=== High-Quality AI Video Upscaler ===")
-    log.info(f"  Node={NODE_ID} | Mode={PIPELINE_MODE} | Model={MODEL_NAME} | Scale={SCALE_FACTOR}x -> {TARGET_HEIGHT}p | Denoise={DENOISE_STRENGTH}")
+    log.info(f"  Node={NODE_ID} | Mode={PIPELINE_MODE} | Model={MODEL_NAME} | Target={TARGET_HEIGHT}p | Tile={UPSCALE_TILE or 'auto'} | TilePad={UPSCALE_TILE_PAD} | Denoise={DENOISE_STRENGTH}")
     log.info(f"  GPU={USE_GPU} | Parallel={PARALLEL_JOBS} | Checkpoint every {CHECKPOINT_INTERVAL} frames")
     log.info(f"  Quality: CRF 16 H.265, unsharp post-process, FP16 GPU inference")
     for d in (STAGING_DIR,OUTPUT_DIR,CHECKPOINT_DIR): os.makedirs(d,exist_ok=True)

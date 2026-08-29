@@ -212,3 +212,31 @@ async def claim_upscale_job(node_id: str) -> dict | None:
     item = await get_item(item_id)
     return item if item and item.get("upscale_node") == node_id else None
 
+
+async def adopt_upscale_job(item_id: str, node_id: str) -> dict | None:
+    """Adopt a legacy processing/queued job that has no node owner recorded."""
+    async with _connect() as conn:
+        await conn.execute(
+            "UPDATE items SET upscale_node=?, "
+            "upscale_started_at=COALESCE(upscale_started_at, datetime('now')), "
+            "updated_at=datetime('now') "
+            "WHERE id=? AND upscale_node IS NULL AND upscale_status IN ('queued', 'processing')",
+            (node_id, item_id),
+        )
+        await conn.commit()
+    item = await get_item(item_id)
+    return item if item and item.get("upscale_node") == node_id else None
+
+
+async def get_processing_upscale_job(node_id: str) -> dict | None:
+    """Return the oldest in-flight upscale job already owned by a node."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM items WHERE upscale_status='processing' AND upscale_node=? "
+            "ORDER BY COALESCE(upscale_started_at, created_at) LIMIT 1",
+            (node_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+

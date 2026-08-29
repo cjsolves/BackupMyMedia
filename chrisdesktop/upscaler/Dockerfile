@@ -29,6 +29,8 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Download Real-ESRGAN model weights
 RUN mkdir -p /models && \
+    wget -q -O /models/RealESRGAN_x2plus.pth \
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth" && \
     wget -q -O /models/RealESRGAN_x4plus.pth \
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" && \
     wget -q -O /models/RealESRGAN_x4plus_anime_6B.pth \

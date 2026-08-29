@@ -231,21 +231,23 @@ async def detect_stuck_jobs():
             await db.set_problem(item["id"], "stuck_transcoding",
                                  f"Transcode has not progressed in {int(age_min)} minutes")
 
-        # Upscale track: reset dead node claims so another node can pick up the job
+        # Upscale track: reset dead node claims only when heartbeats stop,
+        # not merely because a long-running upscale exceeded total runtime.
         if item.get("upscale_status") == "processing":
-            started = _parse_dt(item.get("upscale_started_at"))
-            if started:
-                upscale_age_min = (now - started).total_seconds() / 60
-                if upscale_age_min > settings.STUCK_THRESHOLD_UPSCALING:
+            last_progress = _parse_dt(item.get("updated_at")) or _parse_dt(item.get("upscale_started_at"))
+            if last_progress:
+                silent_min = (now - last_progress).total_seconds() / 60
+                if silent_min > settings.STUCK_THRESHOLD_UPSCALING:
                     node = item.get("upscale_node", "unknown")
                     await db.upsert_item({
                         "id": item["id"],
                         "upscale_status": "queued",
                         "upscale_node": None,
                         "upscale_pct": 0,
+                        "upscale_started_at": None,
                     })
                     await db.log_event(item["id"], "upscale_reset",
-                                       f"Node '{node}' silent for >{int(upscale_age_min)}min — re-queued")
+                                       f"Node '{node}' silent for >{int(silent_min)}min — re-queued")
 
 
 def _parse_dt(s: str | None) -> datetime | None:

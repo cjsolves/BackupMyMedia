@@ -222,6 +222,10 @@ class ClaimRequest(BaseModel):
     node_id: str
 
 
+class AdoptRequest(BaseModel):
+    node_id: str
+
+
 @app.post("/api/upscale/claim")
 async def api_upscale_claim(body: ClaimRequest):
     """Node calls this to atomically claim the next queued upscale job."""
@@ -230,6 +234,25 @@ async def api_upscale_claim(body: ClaimRequest):
         from fastapi.responses import Response
         return Response(status_code=204)
     await broadcast("update", {"reason": "upscale_claimed", "item_id": item["id"], "node": body.node_id})
+    return item
+
+
+@app.post("/api/upscale/{item_id}/adopt")
+async def api_upscale_adopt(item_id: str, body: AdoptRequest):
+    """Adopt a legacy queued/processing job that has no node owner recorded."""
+    item = await db.adopt_upscale_job(item_id, body.node_id)
+    if not item:
+        raise HTTPException(409, "Item already owned or not adoptable")
+    await broadcast("update", {"reason": "upscale_adopted", "item_id": item_id, "node": body.node_id})
+    return item
+
+
+@app.get("/api/upscale/current/{node_id}")
+async def api_upscale_current(node_id: str):
+    """Fetch the current in-flight upscale job already assigned to a node."""
+    item = await db.get_processing_upscale_job(node_id)
+    if not item:
+        raise HTTPException(404, "No in-flight job for node")
     return item
 
 
