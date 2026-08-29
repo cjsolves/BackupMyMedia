@@ -262,11 +262,11 @@ async def api_upscale_source(item_id: str):
     item = await db.get_item(item_id)
     if not item:
         raise HTTPException(404, "Item not found")
-    mkv = engine.find_main_mkv(item.get("nas_lossless_path", ""))
-    if not mkv:
+    video = engine.find_main_video(item.get("nas_lossless_path", ""))
+    if not video:
         raise HTTPException(404, "Source MKV not found")
-    return FileResponse(mkv, media_type="video/x-matroska",
-                        filename=os.path.basename(mkv))
+    return FileResponse(video, media_type="video/x-matroska",
+                        filename=os.path.basename(video))
 
 
 @app.post("/api/upscale/{item_id}/result")

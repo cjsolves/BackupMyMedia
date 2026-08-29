@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from app.config import settings
 from app import database as db
@@ -18,16 +19,18 @@ log = logging.getLogger("engine")
 UPSCALE_STAGING = os.environ.get("PATH_UPSCALE_STAGING", "/media/upscale-queue")
 UPSCALE_OUTPUT  = os.environ.get("PATH_UPSCALE_OUTPUT",  "/media/upscale-output")
 LOSSLESS_ROOT   = settings.PATH_NAS_LOSSLESS
+VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".m2ts"}
 
 
-def find_main_mkv(lossless_path: str) -> str | None:
-    """Return the largest MKV under a lossless folder, or None."""
+def find_main_video(lossless_path: str) -> str | None:
+    """Return the largest supported video file under a folder, or None."""
     if not lossless_path or not os.path.isdir(lossless_path):
         return None
     files = [(os.path.getsize(fp), fp)
              for root, _, fs in os.walk(lossless_path)
              for f in fs
-             if (fp := os.path.join(root, f)).lower().endswith(".mkv")]
+             if Path(f).suffix.lower() in VIDEO_EXTS
+             if (fp := os.path.join(root, f))]
     return sorted(files, reverse=True)[0][1] if files else None
 
 
@@ -315,8 +318,8 @@ async def reclassify_item(item_id: str, new_title: str, new_year: str,
 # Resolution detection + upscale queue management
 # ---------------------------------------------------------------------------
 
-def get_video_resolution(file_path: str) -> tuple[int, int]:
-    """Use ffprobe to get video dimensions. Returns (width, height) or (0,0)."""
+def get_video_info(file_path: str) -> dict:
+    """Use ffprobe to get the primary video stream info, or {} on failure."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -326,10 +329,61 @@ def get_video_resolution(file_path: str) -> tuple[int, int]:
         data = json.loads(result.stdout)
         streams = data.get("streams", [])
         if streams:
-            return streams[0].get("width", 0), streams[0].get("height", 0)
+            return streams[0]
     except Exception as e:
         log.warning(f"ffprobe failed on {file_path}: {e}")
-    return 0, 0
+    return {}
+
+
+def _copy_directory(src: str, dst: str):
+    """Copy a directory, merging files if destination exists."""
+    if os.path.exists(dst):
+        for dirpath, dirnames, filenames in os.walk(src):
+            rel = os.path.relpath(dirpath, src)
+            target_dir = dst if rel == "." else os.path.join(dst, rel)
+            os.makedirs(target_dir, exist_ok=True)
+            for dirname in dirnames:
+                os.makedirs(os.path.join(target_dir, dirname), exist_ok=True)
+            for fname in filenames:
+                src_file = os.path.join(dirpath, fname)
+                dst_file = os.path.join(target_dir, fname)
+                if not os.path.exists(dst_file):
+                    shutil.copy2(src_file, dst_file)
+    else:
+        shutil.copytree(src, dst)
+
+
+async def mark_ready_video_complete(item: dict, codec_name: str) -> bool:
+    """Fast-path already compliant video into the local Plex cache and mark complete."""
+    item_id = item["id"]
+    media = item.get("media_type", "unknown")
+    subdir = {"movie": "Movies", "tv": "TV"}.get(media)
+    lossless_path = item.get("nas_lossless_path", "")
+    if not subdir or not lossless_path or not os.path.isdir(lossless_path):
+        return False
+
+    plex_root = settings.PATH_NAS_PLEX
+    plex_dir = os.path.join(plex_root, subdir, item_id)
+
+    try:
+        os.makedirs(os.path.dirname(plex_dir), exist_ok=True)
+        await asyncio.get_running_loop().run_in_executor(None, _copy_directory, lossless_path, plex_dir)
+        await db.upsert_item({
+            "id": item_id,
+            "nas_plex_path": plex_dir,
+            "upscale_status": "skipped",
+            "upscale_step": "ready_direct",
+            "upscale_error": None,
+        })
+        await db.set_state(item_id, "complete", f"Already compliant ({codec_name}); staged in local Plex cache")
+        await db.log_event(item_id, "ready_direct",
+                           f"Already {codec_name}/{item.get('original_height', 0)}p — copied to local Plex cache")
+        log.info(f"[{item_id}] Already compliant — copied to local Plex cache and marked complete")
+        return True
+    except Exception as e:
+        log.error(f"[{item_id}] Fast-path to local Plex failed: {e}")
+        await db.set_problem(item_id, "move_failed", f"Fast-path to local Plex failed: {e}")
+        return False
 
 
 async def check_and_queue_upscale(item_id: str):
@@ -348,21 +402,22 @@ async def check_and_queue_upscale(item_id: str):
     if not lossless_path or not os.path.exists(lossless_path):
         return
 
-    # Find the main MKV file (largest file in the folder)
-    mkv_files = []
+    # Find the main video file (largest supported video in the folder)
+    video_files = []
     for root, _, files in os.walk(lossless_path):
         for f in files:
-            if f.lower().endswith(".mkv"):
+            if Path(f).suffix.lower() in VIDEO_EXTS:
                 full = os.path.join(root, f)
-                mkv_files.append((os.path.getsize(full), full))
+                video_files.append((os.path.getsize(full), full))
 
-    if not mkv_files:
+    if not video_files:
         return
 
-    main_mkv = sorted(mkv_files, reverse=True)[0][1]
-    width, height = await asyncio.get_running_loop().run_in_executor(
-        None, get_video_resolution, main_mkv
-    )
+    main_video = sorted(video_files, reverse=True)[0][1]
+    stream = await asyncio.get_running_loop().run_in_executor(None, get_video_info, main_video)
+    width = int(stream.get("width", 0) or 0)
+    height = int(stream.get("height", 0) or 0)
+    codec_name = (stream.get("codec_name") or "").lower()
 
     log.info(f"[{item_id}] Resolution: {width}x{height}")
 
@@ -377,7 +432,13 @@ async def check_and_queue_upscale(item_id: str):
 
     if height >= threshold:
         log.info(f"[{item_id}] Already {height}p >= {threshold}p — no upscaling needed")
-        await db.upsert_item({"id": item_id, "upscale_status": "skipped"})
+        await db.upsert_item({"id": item_id, "upscale_status": "skipped", "upscale_step": None, "upscale_error": None})
+
+        # Fast-path videos that already meet delivery requirements into the NAS-move queue.
+        if codec_name in ("hevc", "h265"):
+            fresh_item = await db.get_item(item_id)
+            if fresh_item:
+                await mark_ready_video_complete(fresh_item, codec_name)
         return
 
     # Below threshold: mark as queued — any available node will claim via /api/upscale/claim
@@ -430,11 +491,11 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
     if not os.path.exists(dst) or os.path.getsize(dst) <= 0:
         return {"ok": False, "error": f"Promoted output invalid or zero bytes: {dst}"}
 
-    # Delete original MKV(s) — upscaled version supersedes them
+    # Delete original source video(s) — upscaled version supersedes them
     for dirpath, _, files in os.walk(lossless_path):
         for fname in files:
             fpath = os.path.join(dirpath, fname)
-            if fpath != dst and fname.lower().endswith(".mkv"):
+            if fpath != dst and Path(fname).suffix.lower() in VIDEO_EXTS:
                 try:
                     os.remove(fpath)
                     log.info(f"[{item_id}] Deleted pre-upscale original: {fname}")

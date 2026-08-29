@@ -88,6 +88,7 @@ DENOISE_STRENGTH    = float(os.environ.get("DENOISE_STRENGTH", "3"))
 # Set to "false" to keep audio completely untouched
 AUDIO_CLEANUP       = os.environ.get("AUDIO_CLEANUP", "true").lower() == "true"
 AUDIO_NOISE_FLOOR   = float(os.environ.get("AUDIO_NOISE_FLOOR", "-25"))  # dBFS noise threshold
+VIDEO_EXTS          = {".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".m2ts"}
 
 _shutdown = False
 
@@ -562,11 +563,12 @@ def _resolve_claimed_input(item: dict) -> str | None:
     if not lossless or not os.path.isdir(lossless):
         log.warning(f"[{item_id}] NAS lossless path not accessible: {lossless}")
         return None
-    mkvs = sorted(Path(lossless).glob("**/*.mkv"), key=lambda p: p.stat().st_size, reverse=True)
-    if not mkvs:
-        log.warning(f"[{item_id}] No MKV at {lossless}")
+    videos = sorted((p for p in Path(lossless).glob("**/*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS),
+                    key=lambda p: p.stat().st_size, reverse=True)
+    if not videos:
+        log.warning(f"[{item_id}] No source video at {lossless}")
         return None
-    return str(mkvs[0])
+    return str(videos[0])
 
 
 def claim_next(active_ids: set[str]) -> tuple[str, str] | None:
