@@ -202,11 +202,11 @@ function render(){
     nb.style.display='';
     nb.innerHTML='<div class="now-title"><span class="spinner"></span> Currently upscaling</div>'+
       proc.map(p=>{
-        const pct=p.upscale_pct||0,node=p.upscale_node||'local';
+        const pct=p.upscale_pct||0,node=p.upscale_node||'local',eta=calcEta(p.upscale_started_at,pct);
         return`<div style="margin-top:10px">`+
           `<div class="pct-label" style="display:flex;justify-content:space-between;margin-bottom:4px">`+
           `<span>${p.title||p.id}${p.year?` (${p.year})`:''}</span>`+
-          `<span style="color:var(--muted);font-size:11px">${node} · ${pct}%</span></div>`+
+          `<span style="color:var(--muted);font-size:11px">${node} \u00b7 ${pct}% \u00b7 ETA ${eta}</span></div>`+
           `<div class="big-bar"><div class="big-bar-fill" style="width:${pct}%"></div></div></div>`;
       }).join('');
   }else{nb.style.display='none'}
@@ -239,7 +239,7 @@ function ic(i){
   let tag='';
   if(us==='complete')tag='<span class="tag tag-done">✨ upscaled 1080p</span>';
   else if(us==='skipped')tag='<span class="tag tag-skip">1080p+ skip</span>';
-  else if(us==='processing')tag=`<span class="tag tag-proc">⚡ ${i.upscale_pct||0}%${i.upscale_node&&i.upscale_node!=='local'?' · '+i.upscale_node:''}</span>`;
+  else if(us==='processing')tag=`<span class="tag tag-proc">⚡ ${i.upscale_pct||0}% · ${calcEta(i.upscale_started_at,i.upscale_pct||0)}${i.upscale_node&&i.upscale_node!=='local'?' · '+i.upscale_node:''}</span>`;
   else if(us==='queued')tag='<span class="tag tag-q">⏳ queued</span>';
   else if(h>0)tag=`<span class="tag tag-q">↑ ${h}p→1080p</span>`;
   else tag='<span class="tag tag-unk">unchecked</span>';
@@ -278,6 +278,15 @@ function renderLog(){
 }
 
 function sz(b){if(!b)return'';if(b>=1e9)return(b/1e9).toFixed(1)+' GB';if(b>=1e6)return(b/1e6).toFixed(0)+' MB';return(b/1e3).toFixed(0)+' KB'}
+function calcEta(startedAt,pct){
+  if(!startedAt||pct<=0)return'\u2014';
+  const elapsed=(Date.now()-new Date(startedAt.replace(' ','T')+'Z').getTime())/1000;
+  const rem=elapsed/pct*(100-pct);
+  if(rem<90)return'<2 min';
+  if(rem<3600)return Math.round(rem/60)+' min';
+  const h=Math.floor(rem/3600),m=Math.round((rem%3600)/60);
+  return m?h+'h '+m+'m':h+'h';
+}
 function esc(s){return(s||'').replace(/'/g,"\\'")}
 function toggleRC(id){document.getElementById('form-'+CSS.escape(id))?.classList.toggle('open')}
 
