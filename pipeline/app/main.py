@@ -279,8 +279,16 @@ async def api_upscale_status(item_id: str, body: UpscaleStatusRequest):
         "upscale_status": body.state,
         "upscale_pct": pct,
     })
-    if body.state == "processing" and not await db.get_item(item_id):
-        pass  # item not tracked yet, skip
+    # Stamp started_at on first processing report if the claim path didn't set it
+    if body.state == "processing":
+        item = await db.get_item(item_id)
+        if item and not item.get("upscale_started_at"):
+            async with db._connect() as conn:
+                await conn.execute(
+                    "UPDATE items SET upscale_started_at=datetime('now') WHERE id=? AND upscale_started_at IS NULL",
+                    (item_id,)
+                )
+                await conn.commit()
     await db.log_event(item_id, f"upscale:{body.state}",
                        json.dumps(body.detail) if body.detail else "")
     await broadcast("update", {
