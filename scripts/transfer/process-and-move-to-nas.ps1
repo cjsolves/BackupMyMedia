@@ -1,15 +1,20 @@
 <#
 .SYNOPSIS
-    Moves finished media from D:\PlexMedia\Lossless to NAS Plex (P:\Movies / P:\TV).
+        Moves finished media to NAS only after the correct pipeline stage is complete.
 
 .DESCRIPTION
-    An item is "ready" when:
-      - Pipeline state = on_nas_lossless
-      - upscale_status = skipped (already 1080p+, no upscaling needed)
-      - OR upscale_status = complete (upscaler finished, file replaced in Lossless)
+        Video items are "ready" only when Tdarr has already produced the local Plex copy:
+            - Pipeline state = complete
+            - media_type = movie or tv
+            - Source folder exists under D:\PlexMedia\Plex\Movies or D:\PlexMedia\Plex\TV
+
+        Music bypasses Tdarr and is ready when:
+            - Pipeline state = on_nas_lossless
+            - media_type = music
+            - Source folder exists under D:\PlexMedia\Lossless\Music
 
     For each ready item the script:
-      1. Moves the folder from D:\Lossless to P:\ (NAS Plex)
+            1. Moves the final local output to the correct NAS destination
       2. Deletes any leftover cache files on D: for that item
       3. Tells the pipeline API the item is complete (so the dashboard stays accurate)
 
@@ -21,6 +26,8 @@
 
 $PIPELINE_API  = "http://localhost:8090"
 $LOSSLESS_ROOT = "D:\PlexMedia\Lossless"
+$PLEX_ROOT     = "D:\PlexMedia\Plex"
+$NAS_LOSSLESS_ROOT = "L:\"
 $NAS_PLEX_ROOT = "P:\"
 $LOG           = "D:\VidProcess\process-to-nas.log"
 
@@ -71,18 +78,28 @@ try {
 }
 
 # ---- Find ready items
-$ready = $items | Where-Object {
-    $_.state -eq "on_nas_lossless" -and
-    $_.upscale_status -in @("skipped", "complete") -and
+$readyVideo = $items | Where-Object {
+    $_.state -eq "complete" -and
+    $_.media_type -in @("movie", "tv") -and
     ($upscaleQueue -notcontains $_.id)
 }
+
+$readyMusic = $items | Where-Object {
+    $_.state -eq "on_nas_lossless" -and
+    $_.media_type -eq "music" -and
+    ($upscaleQueue -notcontains $_.id)
+}
+
+$ready = @($readyVideo) + @($readyMusic)
 
 Write-Log "=== NAS move started: $($ready.Count) item(s) ready ==="
 
 if ($ready.Count -eq 0) {
     # Show pending counts for visibility
-    $pending = $items | Where-Object { $_.state -eq "on_nas_lossless" -and $_.upscale_status -notin @("skipped","complete") }
-    Write-Log "  Waiting on upscale: $($pending | Where-Object {$_.upscale_status -eq 'queued'} | Measure-Object).Count queued, $($pending | Where-Object {$_.upscale_status -eq 'processing'} | Measure-Object).Count processing, $($pending | Where-Object {-not $_.upscale_status} | Measure-Object).Count unchecked"
+    $waitingUpscale = $items | Where-Object { $_.state -eq "on_nas_lossless" -and $_.media_type -ne "music" }
+    $waitingTdarr   = $items | Where-Object { $_.media_type -in @("movie", "tv") -and $_.state -in @("on_nas_lossless", "queued_transcode", "transcoding") }
+    Write-Log "  Waiting on upscale: $((@($waitingUpscale | Where-Object {$_.upscale_status -eq 'queued'})).Count) queued, $((@($waitingUpscale | Where-Object {$_.upscale_status -eq 'processing'})).Count) processing, $((@($waitingUpscale | Where-Object {-not $_.upscale_status})).Count) unchecked"
+    Write-Log "  Waiting on Tdarr/Plex output: $($waitingTdarr.Count)"
     exit 0
 }
 
@@ -94,16 +111,27 @@ foreach ($item in $ready) {
     $subdir = @{movie="Movies"; tv="TV"; music="Music"}[$media]
     if (-not $subdir) { $subdir = "Movies" }
 
-    $src = Join-Path "$LOSSLESS_ROOT\$subdir" $id
-    $dst = Join-Path "$NAS_PLEX_ROOT\$subdir" $id
+    if ($media -eq "music") {
+        $src = Join-Path "$LOSSLESS_ROOT\Music" $id
+        $dstRoot = "$NAS_LOSSLESS_ROOT\Music"
+        $dst = Join-Path $dstRoot $id
+        $nasPath = "\\NAS\Lossless\Music\$id"
+        $label = "NAS Lossless\Music"
+    } else {
+        $src = Join-Path "$PLEX_ROOT\$subdir" $id
+        $dstRoot = "$NAS_PLEX_ROOT\$subdir"
+        $dst = Join-Path $dstRoot $id
+        $nasPath = "\\NAS\Plex\$subdir\$id"
+        $label = "NAS Plex\$subdir"
+    }
 
     if (-not (Test-Path $src)) {
         Write-Log "  SKIP (source not found): $id"
         continue
     }
 
-    if (-not (Test-Path "$NAS_PLEX_ROOT\$subdir")) {
-        New-Item "$NAS_PLEX_ROOT\$subdir" -ItemType Directory -Force | Out-Null
+    if (-not (Test-Path $dstRoot)) {
+        New-Item $dstRoot -ItemType Directory -Force | Out-Null
     }
 
     Write-Log "  Moving: $id"
@@ -113,13 +141,12 @@ foreach ($item in $ready) {
         # Delete any remaining D: cache for this item
         Delete-CacheFor $id $subdir
 
-        # Tell pipeline the item is complete
-        $nasPath = "\\NAS\Plex\$subdir\$id"
+        # Tell pipeline the item is complete on NAS
         Invoke-RestMethod "$PIPELINE_API/api/items/$([Uri]::EscapeDataString($id))/moved_to_nas" `
             -Method POST -ContentType "application/json" `
             -Body (ConvertTo-Json @{nas_plex_path=$nasPath}) -EA SilentlyContinue | Out-Null
 
-        Write-Log "  Done: $id -> NAS Plex\$subdir"
+        Write-Log "  Done: $id -> $label"
         $moved++
     } catch {
         Write-Log "  FAILED: $id — $_"
