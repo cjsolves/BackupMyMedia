@@ -382,7 +382,14 @@ async def check_and_queue_upscale(item_id: str):
 
     # Below threshold: mark as queued — any available node will claim via /api/upscale/claim
     log.info(f"[{item_id}] {height}p < {threshold}p — queuing for AI upscale (pipeline continues unblocked)")
-    await db.upsert_item({"id": item_id, "upscale_status": "queued"})
+    await db.upsert_item({
+        "id": item_id,
+        "upscale_status": "queued",
+        "upscale_pct": 0,
+        "upscale_node": None,
+        "upscale_started_at": None,
+        "upscale_completed_at": None,
+    })
     await db.log_event(
         item_id, "upscale_queued",
         f"{width}x{height} → queued for AI upscale to {threshold}p. Main pipeline continues."
