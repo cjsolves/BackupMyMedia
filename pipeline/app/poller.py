@@ -112,14 +112,14 @@ async def poll_tdarr():
             # Get worker status
             r = await client.post(
                 f"{settings.TDARR_URL}/api/v2/cruddb",
-                json={"data": {"collection": "TableWorkers", "mode": "getAll", "docid": ""}},
+                json={"data": {"collection": "NodeJSONDB", "mode": "getAll", "docID": ""}},
             )
             workers = r.json() if r.status_code == 200 else []
 
             # Get job queue
             r2 = await client.post(
                 f"{settings.TDARR_URL}/api/v2/cruddb",
-                json={"data": {"collection": "TableJobs", "mode": "getAll", "docid": ""}},
+                json={"data": {"collection": "JobsJSONDB", "mode": "getAll", "docID": ""}},
             )
             jobs = r2.json() if r2.status_code == 200 else []
     except Exception as e:
@@ -128,31 +128,40 @@ async def poll_tdarr():
 
     # Match Tdarr jobs back to pipeline items
     for job in (jobs if isinstance(jobs, list) else []):
+        if (job.get("job") or {}).get("type") != "transcode":
+            continue
         file_path = job.get("file", "")
         item_id = _path_to_item_id(file_path)
         if not item_id:
             continue
 
-        status = (job.get("statusTs") or job.get("status") or "").lower()
-        tdarr_state = "queued_transcode"
-        if "transcode" in status or "worker" in status:
+        status = (job.get("status") or "").lower()
+        is_active = not job.get("end")
+
+        if is_active:
             tdarr_state = "transcoding"
-        elif "success" in status or "done" in status:
-            tdarr_state = "complete"
-        elif "error" in status or "fail" in status:
-            await db.set_problem(item_id, "transcode_failed",
-                                 job.get("errorStats", {}).get("lastError", ""))
+        elif "error" in status or "cancel" in status or status == "error":
+            await db.set_problem(
+                item_id,
+                "transcode_failed",
+                job.get("errorStats", {}).get("lastError") or job.get("status") or "Tdarr transcode failed",
+            )
             continue
+        elif "success" in status:
+            tdarr_state = None
+        elif status == "not required":
+            tdarr_state = None
+        else:
+            tdarr_state = "queued_transcode"
 
         existing = await db.get_item(item_id)
         if existing and existing["state"] in ("on_nas_lossless", "queued_transcode", "transcoding"):
-            await db.set_state(item_id, tdarr_state)
-            if tdarr_state == "complete":
-                await db.upsert_item({
-                    "id": item_id,
-                    "tdarr_job_id": job.get("_id", ""),
-                    "nas_plex_path": job.get("outputFilePath", ""),
-                })
+            updates = {"id": item_id, "tdarr_job_id": job.get("_id", "")}
+            if job.get("outputFilePath"):
+                updates["nas_plex_path"] = job.get("outputFilePath", "")
+            await db.upsert_item(updates)
+            if tdarr_state:
+                await db.set_state(item_id, tdarr_state)
 
     return {"workers": workers, "jobs": jobs}
 
