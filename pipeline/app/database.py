@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS items (
     original_height    INTEGER DEFAULT 0,
     upscale_started_at TEXT,
     upscale_completed_at TEXT,
-    upscale_node       TEXT DEFAULT NULL   -- which node owns this job (null = unclaimed)
+    upscale_node       TEXT DEFAULT NULL,  -- which node owns this job (null = unclaimed)
+    upscale_step       TEXT DEFAULT NULL,
+    upscale_error      TEXT DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -54,6 +56,8 @@ ALTER TABLE items ADD COLUMN original_height INTEGER DEFAULT 0;
 ALTER TABLE items ADD COLUMN upscale_started_at TEXT;
 ALTER TABLE items ADD COLUMN upscale_completed_at TEXT;
 ALTER TABLE items ADD COLUMN upscale_node TEXT DEFAULT NULL;
+ALTER TABLE items ADD COLUMN upscale_step TEXT DEFAULT NULL;
+ALTER TABLE items ADD COLUMN upscale_error TEXT DEFAULT NULL;
 """
 
 # Valid pipeline states in order
@@ -228,15 +232,14 @@ async def adopt_upscale_job(item_id: str, node_id: str) -> dict | None:
     return item if item and item.get("upscale_node") == node_id else None
 
 
-async def get_processing_upscale_job(node_id: str) -> dict | None:
-    """Return the oldest in-flight upscale job already owned by a node."""
+async def get_processing_upscale_jobs(node_id: str) -> list[dict]:
+    """Return in-flight upscale jobs already owned by a node, oldest first."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT * FROM items WHERE upscale_status='processing' AND upscale_node=? "
-            "ORDER BY COALESCE(upscale_started_at, created_at) LIMIT 1",
+            "ORDER BY COALESCE(upscale_started_at, created_at)",
             (node_id,),
         )
-        row = await cur.fetchone()
-        return dict(row) if row else None
+        return [dict(r) for r in await cur.fetchall()]
 

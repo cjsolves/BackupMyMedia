@@ -341,7 +341,7 @@ async def check_and_queue_upscale(item_id: str):
         return  # music never needs upscaling
 
     # Already queued/processed
-    if item.get("upscale_status") in ("queued", "processing", "complete", "skipped"):
+    if item.get("upscale_status") in ("queued", "processing", "complete", "skipped", "failed"):
         return
 
     lossless_path = item.get("nas_lossless_path", "")
@@ -389,6 +389,8 @@ async def check_and_queue_upscale(item_id: str):
         "upscale_node": None,
         "upscale_started_at": None,
         "upscale_completed_at": None,
+        "upscale_step": None,
+        "upscale_error": None,
     })
     await db.log_event(
         item_id, "upscale_queued",
@@ -414,6 +416,8 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
 
     if not os.path.exists(upscaled_path):
         return {"ok": False, "error": f"Upscaled file not found: {upscaled_path}"}
+    if os.path.getsize(upscaled_path) <= 0:
+        return {"ok": False, "error": f"Upscaled file is zero bytes: {upscaled_path}"}
 
     try:
         upscaled_filename = os.path.basename(upscaled_path)
@@ -422,6 +426,9 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
         log.info(f"[{item_id}] Placed upscaled file: {dst}")
     except Exception as e:
         return {"ok": False, "error": f"Failed to replace NAS copy: {e}"}
+
+    if not os.path.exists(dst) or os.path.getsize(dst) <= 0:
+        return {"ok": False, "error": f"Promoted output invalid or zero bytes: {dst}"}
 
     # Delete original MKV(s) — upscaled version supersedes them
     for dirpath, _, files in os.walk(lossless_path):
@@ -446,6 +453,8 @@ async def promote_upscale_complete(item_id: str, upscaled_path: str) -> dict:
         "upscale_pct": 100,
         "upscale_completed_at": datetime.now(timezone.utc).isoformat(),
         "upscale_node": None,
+        "upscale_step": "complete",
+        "upscale_error": None,
     })
     await db.log_event(item_id, "upscale_complete",
                        "NAS Lossless replaced with 1080p upscaled version")

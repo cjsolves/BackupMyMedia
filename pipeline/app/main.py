@@ -249,11 +249,11 @@ async def api_upscale_adopt(item_id: str, body: AdoptRequest):
 
 @app.get("/api/upscale/current/{node_id}")
 async def api_upscale_current(node_id: str):
-    """Fetch the current in-flight upscale job already assigned to a node."""
-    item = await db.get_processing_upscale_job(node_id)
-    if not item:
+    """Fetch in-flight upscale jobs already assigned to a node."""
+    items = await db.get_processing_upscale_jobs(node_id)
+    if not items:
         raise HTTPException(404, "No in-flight job for node")
-    return item
+    return items
 
 
 @app.get("/api/upscale/{item_id}/source")
@@ -312,11 +312,19 @@ class UpscaleCompleteRequest(BaseModel):
 async def api_upscale_status(item_id: str, body: UpscaleStatusRequest):
     """Upscaler service calls this to report progress. Updates upscale_status column only."""
     pct = body.detail.get("pct", 0) if body.detail else 0
-    await db.upsert_item({
+    updates = {
         "id": item_id,
         "upscale_status": body.state,
         "upscale_pct": pct,
-    })
+    }
+    if body.detail:
+        if "step" in body.detail:
+            updates["upscale_step"] = body.detail.get("step")
+        if body.state == "failed":
+            updates["upscale_error"] = body.detail.get("error", "Upscale failed")
+        elif body.state == "processing":
+            updates["upscale_error"] = None
+    await db.upsert_item(updates)
     # Stamp started_at on first processing report if the claim path didn't set it
     if body.state == "processing":
         item = await db.get_item(item_id)
@@ -335,6 +343,27 @@ async def api_upscale_status(item_id: str, body: UpscaleStatusRequest):
         "upscale_state": body.state,
         "pct": pct,
     })
+    return {"ok": True}
+
+
+@app.post("/api/items/{item_id}/retry_upscale")
+async def api_retry_upscale(item_id: str):
+    """Clear a failed upscale and re-queue it for processing again."""
+    item = await db.get_item(item_id)
+    if not item:
+        raise HTTPException(404)
+    await db.upsert_item({
+        "id": item_id,
+        "upscale_status": "queued",
+        "upscale_pct": 0,
+        "upscale_node": None,
+        "upscale_started_at": None,
+        "upscale_completed_at": None,
+        "upscale_step": None,
+        "upscale_error": None,
+    })
+    await db.log_event(item_id, "upscale_retry", "Manually re-queued failed upscale")
+    await broadcast("update", {"reason": "retry_upscale", "item_id": item_id})
     return {"ok": True}
 
 

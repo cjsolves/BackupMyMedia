@@ -180,7 +180,7 @@ function render(){
   const skip=items.filter(i=>i.upscale_status==='skipped').length;
   const onD=items.filter(i=>i.state==='on_nas_lossless').length;
   const complete=items.filter(i=>i.state==='complete').length;
-  const probs=items.filter(i=>i.state==='problem').length;
+  const probs=items.filter(i=>i.state==='problem'||i.upscale_status==='failed').length;
   document.getElementById('c-proc').textContent=proc.length;
   document.getElementById('c-q').textContent=q;
   document.getElementById('c-unc').textContent=unc;
@@ -202,11 +202,11 @@ function render(){
     nb.style.display='';
     nb.innerHTML='<div class="now-title"><span class="spinner"></span> Currently upscaling</div>'+
       proc.map(p=>{
-        const pct=p.upscale_pct||0,node=p.upscale_node||'local',eta=calcEta(p.upscale_started_at,pct);
+        const pct=p.upscale_pct||0,node=p.upscale_node||'local',eta=calcEta(p.upscale_started_at,pct),step=p.upscale_step||'upscaling';
         return`<div style="margin-top:10px">`+
           `<div class="pct-label" style="display:flex;justify-content:space-between;margin-bottom:4px">`+
           `<span>${p.title||p.id}${p.year?` (${p.year})`:''}</span>`+
-          `<span style="color:var(--muted);font-size:11px">${node} \u00b7 ${pct}% \u00b7 ETA ${eta}</span></div>`+
+          `<span style="color:var(--muted);font-size:11px">${node} \u00b7 ${step} \u00b7 ${pct}% \u00b7 ETA ${eta}</span></div>`+
           `<div class="big-bar"><div class="big-bar-fill" style="width:${pct}%"></div></div></div>`;
       }).join('');
   }else{nb.style.display='none'}
@@ -240,6 +240,7 @@ function ic(i){
   if(us==='complete')tag='<span class="tag tag-done">✨ upscaled 1080p</span>';
   else if(us==='skipped')tag='<span class="tag tag-skip">1080p+ skip</span>';
   else if(us==='processing')tag=`<span class="tag tag-proc">⚡ ${i.upscale_pct||0}% · ${calcEta(i.upscale_started_at,i.upscale_pct||0)}${i.upscale_node&&i.upscale_node!=='local'?' · '+i.upscale_node:''}</span>`;
+  else if(us==='failed')tag=`<span class="tag tag-unk" style="color:var(--red);background:rgba(224,83,74,.15)">⚠ failed${i.upscale_step?' · '+i.upscale_step:''}</span>`;
   else if(us==='queued')tag='<span class="tag tag-q">⏳ queued</span>';
   else if(h>0)tag=`<span class="tag tag-q">↑ ${h}p→1080p</span>`;
   else tag='<span class="tag tag-unk">unchecked</span>';
@@ -249,7 +250,7 @@ function ic(i){
 function renderCache(){
   let list=items.filter(i=>i.state==='on_nas_lossless');
   if(filt==='ready')list=list.filter(i=>i.upscale_status==='skipped'||i.upscale_status==='complete');
-  if(filt==='waiting')list=list.filter(i=>!i.upscale_status||i.upscale_status==='queued'||i.upscale_status==='processing');
+  if(filt==='waiting')list=list.filter(i=>!i.upscale_status||i.upscale_status==='queued'||i.upscale_status==='processing'||i.upscale_status==='failed');
   const el=document.getElementById('cacheItems');
   el.innerHTML=list.length===0?'<div class="empty"><div class="big">📁</div>No items match</div>':list.map(ic).join('');
 }
@@ -262,11 +263,11 @@ function renderNAS(){
 }
 
 function renderProblems(){
-  const list=items.filter(i=>i.state==='problem');
+  const list=[...items.filter(i=>i.state==='problem'), ...items.filter(i=>i.upscale_status==='failed')];
   const el=document.getElementById('probList');
   if(!list.length){el.innerHTML='<div class="empty"><div class="big">✅</div>No problems</div>';return}
   const IC={unclassified:'❓',stuck_ripping:'🔄',stuck_transcoding:'⏳',move_failed:'📦',transcode_failed:'⚠️',orphan_minipc:'👻',orphan_nas:'👻',nas_unreachable:'🔌'};
-  el.innerHTML=list.map(item=>`<div class="problem-card"><div class="prob-hdr"><span class="prob-icon">${IC[item.problem]||'⚠️'}</span><div style="flex:1"><div class="prob-title">${item.title||item.id}${item.year?` (${item.year})`:''}</div><span class="prob-code">${item.problem}</span></div></div><div class="prob-detail">${item.problem_detail||''}</div><div class="prob-actions">${item.problem==='unclassified'?`<button class="btn btn-p" onclick="toggleRC('${esc(item.id)}')">✏️ Set Title</button>`:''}${(item.problem||'').startsWith('orphan')?`<button class="btn btn-d" onclick="delOrphan('${esc(item.id)}')">🗑 Delete</button>`:''}<button class="btn btn-s" onclick="retry('${esc(item.id)}')">↩ Retry</button><button class="btn btn-s" onclick="stopTrack('${esc(item.id)}')">✕ Stop tracking</button></div>${item.problem==='unclassified'?rcForm(item):''}</div>`).join('');
+  el.innerHTML=list.map(item=>`<div class="problem-card"><div class="prob-hdr"><span class="prob-icon">${item.upscale_status==='failed'?'⚠️':(IC[item.problem]||'⚠️')}</span><div style="flex:1"><div class="prob-title">${item.title||item.id}${item.year?` (${item.year})`:''}</div><span class="prob-code">${item.upscale_status==='failed'?'upscale_failed':item.problem}</span></div></div><div class="prob-detail">${item.upscale_status==='failed'?(item.upscale_error||'Upscale failed'):(item.problem_detail||'')}</div><div class="prob-actions">${item.problem==='unclassified'?`<button class="btn btn-p" onclick="toggleRC('${esc(item.id)}')">✏️ Set Title</button>`:''}${(item.problem||'').startsWith('orphan')?`<button class="btn btn-d" onclick="delOrphan('${esc(item.id)}')">🗑 Delete</button>`:''}${item.upscale_status==='failed'?`<button class="btn btn-p" onclick="retryUpscale('${esc(item.id)}')">↩ Retry Upscale</button>`:`<button class="btn btn-s" onclick="retry('${esc(item.id)}')">↩ Retry</button>`}<button class="btn btn-s" onclick="stopTrack('${esc(item.id)}')">✕ Stop tracking</button></div>${item.problem==='unclassified'?rcForm(item):''}</div>`).join('');
 }
 
 function rcForm(item){return`<div class="rc-form" id="form-${CSS.escape(item.id)}"><div class="rc-row"><div><label>Title</label><input id="rct-${CSS.escape(item.id)}" value="${item.title||''}" placeholder="The Dark Knight"></div><div><label>Year</label><input id="rcy-${CSS.escape(item.id)}" value="${item.year||''}" placeholder="2008"></div><div><label>Type</label><select id="rcm-${CSS.escape(item.id)}"><option value="movie" ${item.media_type==='movie'?'selected':''}>Movie</option><option value="tv" ${item.media_type==='tv'?'selected':''}>TV</option><option value="music" ${item.media_type==='music'?'selected':''}>Music</option></select></div></div><div style="margin-top:10px;display:flex;gap:8px"><button class="btn btn-p" onclick="saveRC('${esc(item.id)}')">💾 Save</button><button class="btn btn-s" onclick="toggleRC('${esc(item.id)}')">Cancel</button></div></div>`}
@@ -299,6 +300,7 @@ async function saveRC(id){
   if(r.ok)fetchAll();else alert('Failed: '+await r.text());
 }
 async function retry(id){await fetch(`/api/items/${encodeURIComponent(id)}/retry`,{method:'POST'});fetchAll()}
+async function retryUpscale(id){await fetch(`/api/items/${encodeURIComponent(id)}/retry_upscale`,{method:'POST'});fetchAll()}
 async function delOrphan(id){if(!confirm(`Delete files for "${id}"?`))return;await fetch(`/api/items/${encodeURIComponent(id)}/delete_orphan`,{method:'POST'});fetchAll()}
 async function stopTrack(id){if(!confirm(`Stop tracking "${id}"?`))return;await fetch(`/api/items/${encodeURIComponent(id)}`,{method:'DELETE'});fetchAll()}
 

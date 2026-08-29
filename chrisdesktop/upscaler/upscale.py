@@ -31,7 +31,6 @@ import os
 import shutil
 import signal
 import subprocess
-import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -49,6 +48,7 @@ log = logging.getLogger("upscaler")
 STAGING_DIR         = os.environ.get("UPSCALER_STAGING",      "/media/upscale-queue")
 OUTPUT_DIR          = os.environ.get("UPSCALER_OUTPUT",       "/media/upscale-output")
 CHECKPOINT_DIR      = os.environ.get("UPSCALER_CHECKPOINTS",  "/data/upscale-checkpoints")
+WORK_ROOT           = os.environ.get("UPSCALER_WORK_ROOT",    os.path.join(OUTPUT_DIR, "_cache"))
 PIPELINE_API        = os.environ.get("PIPELINE_API",          "http://localhost:8090")
 POLL_INTERVAL       = int(os.environ.get("POLL_INTERVAL",     "30"))
 CHECKPOINT_INTERVAL = int(os.environ.get("CHECKPOINT_INTERVAL", "150"))
@@ -143,6 +143,53 @@ def save_ckpt(item_id: str, data: dict):
 def del_ckpt(item_id: str):
     p = ckpt_path(item_id)
     if os.path.exists(p): os.remove(p)
+
+
+def item_work_dir(item_id: str) -> str:
+    safe = item_id.replace("/", "_").replace("\\", "_")
+    path = os.path.join(WORK_ROOT, safe)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def item_paths(item_id: str, output_path: str) -> dict:
+    work_dir = item_work_dir(item_id)
+    den_dir = os.path.join(work_dir, "denoised")
+    up_dir = os.path.join(work_dir, "upscaled")
+    os.makedirs(den_dir, exist_ok=True)
+    os.makedirs(up_dir, exist_ok=True)
+    return {
+        "work_dir": work_dir,
+        "den_dir": den_dir,
+        "up_dir": up_dir,
+        "audio": os.path.join(work_dir, "audio.mka"),
+        "output": output_path,
+    }
+
+
+def is_nonzero_file(path: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def frame_count_on_disk(frame_dir: str) -> int:
+    highest = -1
+    for fp in Path(frame_dir).glob("f*.png"):
+        stem = fp.stem[1:]
+        if stem.isdigit():
+            highest = max(highest, int(stem))
+    return highest + 1
+
+
+def cleanup_item_cache(item_id: str, output_path: str):
+    shutil.rmtree(item_work_dir(item_id), ignore_errors=True)
+    out_dir = os.path.dirname(output_path)
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir, ignore_errors=True)
+
+
+def ffmpeg_error(result: subprocess.CompletedProcess) -> str:
+    stderr = result.stderr.decode() if isinstance(result.stderr, bytes) else (result.stderr or "")
+    return stderr.strip()[:1200] or f"ffmpeg exited with code {result.returncode}"
 
 def probe_video(path: str) -> dict:
     try:
@@ -256,152 +303,181 @@ def _api(item_id, state, detail=None):
                    json={"state":state,"detail":detail or {}},timeout=5)
     except Exception: pass
 
-def upscale_video(item_id: str, input_path: str, output_path: str) -> bool:
+def upscale_video(item_id: str, input_path: str, output_path: str) -> dict:
     import cv2
     info = probe_video(input_path)
     src_w, src_h = info.get("width",0), info.get("height",0)
     fps_str = info.get("r_frame_rate","24/1")
     if not src_w:
-        log.error(f"[{item_id}] Cannot probe {input_path}"); return False
+        return {"ok": False, "step": "probe", "error": f"Cannot probe {input_path}", "pct": 0}
 
     out_w, out_h = target_dims(src_w, src_h)
     model_name, model_scale = choose_model(src_h)
     target_scale = required_scale(src_h)
     log.info(f"[{item_id}] {src_w}x{src_h} -> {out_w}x{out_h} | scale={target_scale:.2f}x | model={model_name} | fps={fps_str} | denoise={DENOISE_STRENGTH}")
+    paths = item_paths(item_id, output_path)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     ckpt = load_ckpt(item_id) or {
         "item_id":item_id,"input_path":input_path,"output_path":output_path,
         "started_at":datetime.now(timezone.utc).isoformat(),
         "total_frames":frame_count(input_path),"last_frame":0,"fps_str":fps_str,"status":"in_progress",
     }
+    ckpt["input_path"] = input_path
+    ckpt["output_path"] = output_path
+    ckpt["model_name"] = model_name
+    ckpt["model_scale"] = model_scale
+    ckpt["target_scale"] = target_scale
     save_ckpt(item_id, ckpt)
-    # Always re-extract from frame 0 — temp dir is cleared on each run so partial
-    # frame sets can't be assembled into a complete video after a restart.
-    start_frame = 0
-    _api(item_id, "processing", {"step":"resuming" if ckpt["last_frame"] > 0 else "starting", "pct": 0})
+    current_done = frame_count_on_disk(paths["up_dir"])
+    current_pct = int(100 * current_done / max(ckpt["total_frames"], 1))
+    _api(item_id, "processing", {"step":"resuming" if current_done > 0 else "starting", "pct": current_pct})
 
-    with tempfile.TemporaryDirectory(prefix=f"up_{item_id[:16]}_") as tmp:
-        den_dir  = os.path.join(tmp,"denoised")
-        up_dir   = os.path.join(tmp,"upscaled")
-        audio    = os.path.join(tmp,"audio.mka")
-        os.makedirs(den_dir); os.makedirs(up_dir)
+    if not is_nonzero_file(paths["audio"]):
+        _api(item_id, "processing", {"step":"audio", "pct": current_pct})
+        result = subprocess.run(
+            ["ffmpeg","-y","-i",input_path,"-vn","-c:a","copy","-c:s","copy",paths["audio"]],
+            capture_output=True,
+        )
+        if result.returncode != 0 or not is_nonzero_file(paths["audio"]):
+            return {"ok": False, "step": "audio", "error": ffmpeg_error(result), "pct": current_pct}
 
-        # 1. Extract audio
-        subprocess.run(["ffmpeg","-y","-i",input_path,"-vn","-c:a","copy","-c:s","copy",audio],
-                       capture_output=True)
+    denoise_vf = (f"hqdn3d={DENOISE_STRENGTH:.1f}:{DENOISE_STRENGTH*0.75:.1f}:"
+                  f"{DENOISE_STRENGTH*4:.1f}:{DENOISE_STRENGTH*3:.1f}")
+    den_done = frame_count_on_disk(paths["den_dir"])
+    if den_done < ckpt["total_frames"]:
+        _api(item_id, "processing", {"step":"extracting", "pct": current_pct})
+        log.info(f"[{item_id}] Extracting frames from {den_done} (with pre-denoise)...")
+        select_vf = f"select='gte(n\\,{den_done})',{denoise_vf}" if DENOISE_STRENGTH > 0 else f"select='gte(n\\,{den_done})'"
+        extract_cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-vf", select_vf,
+            "-vsync", "0", "-start_number", str(den_done), "-q:v", "1",
+            os.path.join(paths["den_dir"], "f%08d.png"),
+        ]
+        result = subprocess.run(extract_cmd, capture_output=True)
+        den_done = frame_count_on_disk(paths["den_dir"])
+        if result.returncode != 0 or den_done < ckpt["total_frames"]:
+            return {
+                "ok": False,
+                "step": "extracting",
+                "error": ffmpeg_error(result) if result.returncode != 0 else f"Expected {ckpt['total_frames']} frames, found {den_done}",
+                "pct": current_pct,
+            }
 
-        # 2. Extract + denoise frames
-        denoise_vf = (f"hqdn3d={DENOISE_STRENGTH:.1f}:{DENOISE_STRENGTH*0.75:.1f}:"
-                      f"{DENOISE_STRENGTH*4:.1f}:{DENOISE_STRENGTH*3:.1f}")
-        log.info(f"[{item_id}] Extracting frames from {start_frame} (with pre-denoise)...")
-        extract_cmd = ["ffmpeg", "-y"]
-        if start_frame > 0:
-            # Fast input-side seek — jumps to keyframe near target without decoding all prior frames
-            saved_fps = ckpt.get("fps_str") or fps_str
-            _n, _d = (saved_fps.split("/") + ["1"])[:2]
-            seek_ts = start_frame / (int(_n) / max(int(_d), 1))
-            extract_cmd += ["-ss", f"{seek_ts:.3f}"]
-        extract_cmd += ["-i", input_path]
-        if DENOISE_STRENGTH > 0:
-            extract_cmd += ["-vf", denoise_vf]
-        extract_cmd += ["-vsync", "0", "-start_number", str(start_frame), "-q:v", "1",
-                        os.path.join(den_dir, "f%08d.png")]
-        subprocess.run(extract_cmd, capture_output=True)
+    up_done = frame_count_on_disk(paths["up_dir"])
+    if up_done < ckpt["total_frames"]:
+        model = get_esrgan(model_name, model_scale)
+        last_hb = time.time()
+        for frame_num in range(up_done, ckpt["total_frames"]):
+            if _shutdown:
+                ckpt["last_frame"] = frame_num
+                ckpt["step"] = "upscaling"
+                save_ckpt(item_id, ckpt)
+                return {"ok": False, "step": "shutdown", "error": "Shutdown requested", "pct": int(100 * frame_num / max(ckpt['total_frames'], 1)), "shutdown": True}
+            src_frame = os.path.join(paths["den_dir"], f"f{frame_num:08d}.png")
+            dst_frame = os.path.join(paths["up_dir"], f"f{frame_num:08d}.png")
+            if not os.path.exists(src_frame):
+                return {"ok": False, "step": "upscaling", "error": f"Missing denoised frame: {src_frame}", "pct": int(100 * frame_num / max(ckpt['total_frames'], 1))}
+            img = cv2.imread(src_frame, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return {"ok": False, "step": "upscaling", "error": f"Failed to read frame: {src_frame}", "pct": int(100 * frame_num / max(ckpt['total_frames'], 1))}
+            out_img, _ = model.enhance(img, outscale=target_scale)
+            if out_img.shape[1] != out_w or out_img.shape[0] != out_h:
+                out_img = cv2.resize(out_img, (out_w, out_h), interpolation=cv2.INTER_LANCZOS4)
+            if not cv2.imwrite(dst_frame, out_img, [cv2.IMWRITE_PNG_COMPRESSION, 1]):
+                return {"ok": False, "step": "upscaling", "error": f"Failed to write frame: {dst_frame}", "pct": int(100 * frame_num / max(ckpt['total_frames'], 1))}
+            completed = frame_num + 1
+            if completed % CHECKPOINT_INTERVAL == 0:
+                ckpt["last_frame"] = completed
+                ckpt["step"] = "upscaling"
+                save_ckpt(item_id, ckpt)
+                pct = int(100 * completed / max(ckpt["total_frames"], 1))
+                log.info(f"[{item_id}] {completed}/{ckpt['total_frames']} frames ({pct}%)")
+                _api(item_id, "processing", {"step":"upscaling","pct":pct})
+                last_hb = time.time()
+            elif time.time() - last_hb >= 60:
+                pct = int(100 * completed / max(ckpt["total_frames"], 1))
+                _api(item_id, "processing", {"step":"upscaling","pct":pct})
+                last_hb = time.time()
 
-        frames = sorted(Path(den_dir).glob("f*.png"))
-        log.info(f"[{item_id}] {len(frames)} frames to upscale")
-
-        # 3. Real-ESRGAN per-frame
-        if frames:
-            model = get_esrgan(model_name, model_scale)
-            last_hb = time.time()
-            for i, fp in enumerate(frames):
-                if _shutdown:
-                    ckpt["last_frame"] = start_frame + i
-                    save_ckpt(item_id, ckpt)
-                    return False
-                if i > 0 and i % CHECKPOINT_INTERVAL == 0:
-                    # Save checkpoint but don't block — main loop handles priority via claim throttling
-                    ckpt["last_frame"] = start_frame + i
-                    save_ckpt(item_id, ckpt)
-                    pct = int(100*(start_frame+i)/max(ckpt["total_frames"],1))
-                    log.info(f"[{item_id}] {start_frame+i}/{ckpt['total_frames']} frames ({pct}%)")
-                    _api(item_id,"processing",{"step":"upscaling","pct":pct})
-                    last_hb = time.time()
-                elif time.time() - last_hb >= 60:
-                    pct = int(100*(start_frame+i)/max(ckpt["total_frames"],1))
-                    _api(item_id,"processing",{"step":"upscaling","pct":pct})
-                    last_hb = time.time()
-                img = cv2.imread(str(fp), cv2.IMREAD_UNCHANGED)
-                if img is None:
-                    shutil.copy(fp, os.path.join(up_dir, fp.name)); continue
-                out_img, _ = model.enhance(img, outscale=target_scale)
-                # Resize to exact target (ESRGAN output may differ by 1-2px)
-                if out_img.shape[1] != out_w or out_img.shape[0] != out_h:
-                    out_img = cv2.resize(out_img,(out_w,out_h),interpolation=cv2.INTER_LANCZOS4)
-                cv2.imwrite(os.path.join(up_dir, fp.name), out_img, [cv2.IMWRITE_PNG_COMPRESSION,1])
-
-        # 4. Reassemble: H.265 CRF 16 + mild unsharp mask + optional audio cleanup
+    if os.path.exists(output_path) and os.path.getsize(output_path) == 0:
+        os.remove(output_path)
+    if not is_nonzero_file(output_path):
+        _api(item_id, "processing", {"step":"reassembling", "pct": 99})
         audio_codec = "copy"
         audio_filter_args = []
         if AUDIO_CLEANUP:
             log.info(f"[{item_id}] Reassembling -> H.265 CRF 16 + unsharp + audio cleanup...")
-            audio_codec = "aac"    # re-encode audio with cleanup filters
+            audio_codec = "aac"
             audio_filter_args = ["-af", build_audio_filter(), "-b:a", "192k"]
         else:
             log.info(f"[{item_id}] Reassembling -> H.265 CRF 16 + unsharp (audio passthrough)...")
-
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
         ffmpeg_cmd = [
             "ffmpeg", "-y",
-            "-framerate", fps_str, "-i", os.path.join(up_dir, "f%08d.png"),
-            "-i", audio,
-            "-vf", "unsharp=5:5:0.5:3:3:0.0",   # mild luma sharpen — counters ESRGAN softness
-            "-c:v", "libx265", "-crf", "16",      # CRF 16 = high fidelity H.265
-            "-preset", "slow",                    # better compression (smaller file, same quality)
-            "-x265-params", "deblock=-1,-1",      # softer deblocking = fewer block artifacts
+            "-framerate", fps_str, "-i", os.path.join(paths["up_dir"], "f%08d.png"),
+            "-i", paths["audio"],
+            "-vf", "unsharp=5:5:0.5:3:3:0.0",
+            "-c:v", "libx265", "-crf", "16",
+            "-preset", "slow",
+            "-x265-params", "deblock=-1,-1",
         ] + audio_filter_args + [
             "-c:a", audio_codec,
             "-c:s", "copy",
             "-movflags", "+faststart",
-            output_path
+            output_path,
         ]
+        result = subprocess.run(ffmpeg_cmd, capture_output=True)
+        if result.returncode != 0 or not is_nonzero_file(output_path):
+            return {
+                "ok": False,
+                "step": "reassembling",
+                "error": ffmpeg_error(result) if result.returncode != 0 else f"Output invalid or zero bytes: {output_path}",
+                "pct": 99,
+            }
 
-        r = subprocess.run(ffmpeg_cmd, capture_output=True)
-        if r.returncode != 0:
-            log.error(f"[{item_id}] Reassembly failed: {r.stderr.decode()[:300]}"); return False
-
-    if not os.path.exists(output_path):
-        log.error(f"[{item_id}] Output not found!"); return False
-
-    ckpt["status"]="complete"; ckpt["completed_at"]=datetime.now(timezone.utc).isoformat()
-    save_ckpt(item_id, ckpt); _api(item_id,"processing",{"step":"done","pct":100})
-    log.info(f"[{item_id}] Complete: {output_path}"); return True
+    ckpt["status"] = "complete"
+    ckpt["step"] = "complete"
+    ckpt["last_frame"] = ckpt["total_frames"]
+    ckpt["completed_at"] = datetime.now(timezone.utc).isoformat()
+    save_ckpt(item_id, ckpt)
+    _api(item_id, "processing", {"step":"done","pct":100})
+    log.info(f"[{item_id}] Complete: {output_path}")
+    return {"ok": True, "output_path": output_path}
 
 def run_job(item_id: str, input_path: str) -> bool:
     out_name = Path(input_path).stem + f"_{TARGET_HEIGHT}p_upscaled.mkv"
     output_path = os.path.join(OUTPUT_DIR, item_id, out_name)
     _api(item_id,"processing",{"step":"starting"})
-    success = upscale_video(item_id, input_path, output_path)
-    if success:
+    result = upscale_video(item_id, input_path, output_path)
+    if result.get("ok"):
+        promoted = False
         if PIPELINE_MODE == "remote":
-            success = _upload_result(item_id, output_path)
-            shutil.rmtree(os.path.join(STAGING_DIR, item_id), ignore_errors=True)
+            promoted = _upload_result(item_id, output_path)
         else:
             try:
-                httpx.post(f"{PIPELINE_API}/api/items/{item_id}/upscale_complete",
-                           json={"upscaled_path":output_path},timeout=10)
-            except Exception as e: log.warning(f"[{item_id}] Notify complete failed: {e}")
-        del_ckpt(item_id)
-        if PIPELINE_MODE == "local":
-            staging = os.path.join(STAGING_DIR, item_id)
-            if os.path.exists(staging): shutil.rmtree(staging, ignore_errors=True)
-    elif _shutdown:
+                r = httpx.post(f"{PIPELINE_API}/api/items/{item_id}/upscale_complete",
+                               json={"upscaled_path":output_path},timeout=30)
+                promoted = r.status_code == 200 and r.json().get("ok")
+                if not promoted:
+                    err = r.text[:400]
+                    _api(item_id, "failed", {"step": "promoting", "pct": 99, "error": f"Promote failed: {err}"})
+            except Exception as e:
+                promoted = False
+                _api(item_id, "failed", {"step": "promoting", "pct": 99, "error": str(e)})
+                log.warning(f"[{item_id}] Notify complete failed: {e}")
+        if promoted:
+            del_ckpt(item_id)
+            cleanup_item_cache(item_id, output_path)
+            shutil.rmtree(os.path.join(STAGING_DIR, item_id), ignore_errors=True)
+            return True
+        return False
+    elif result.get("shutdown") or _shutdown:
         log.info(f"[{item_id}] Checkpoint saved — will resume on restart")
     else:
-        _api(item_id,"failed",{"error":"upscale_video returned False"})
-    return success
+        _api(item_id, "failed", {"step": result.get("step", "unknown"), "pct": result.get("pct", 0), "error": result.get("error", "Upscale failed")})
+        log.error(f"[{item_id}] {result.get('step', 'unknown')} failed: {result.get('error', 'Upscale failed')}")
+    return False
 
 
 def _download_source(item_id: str, local_dir: str) -> str | None:
@@ -471,7 +547,7 @@ def _resolve_claimed_input(item: dict) -> str | None:
     return str(mkvs[0])
 
 
-def claim_next() -> tuple[str, str] | None:
+def claim_next(active_ids: set[str]) -> tuple[str, str] | None:
     """Claim the next job. Resumes checkpoints first, then polls the pipeline API."""
     # Resume in-progress checkpoints without re-claiming (already owned in DB)
     if os.path.isdir(CHECKPOINT_DIR):
@@ -484,6 +560,8 @@ def claim_next() -> tuple[str, str] | None:
             if ck.get("status") != "in_progress" or not os.path.exists(ck.get("input_path", "")):
                 continue
             item_id = ck["item_id"]
+            if item_id in active_ids:
+                continue
             # Verify the DB still assigns this job to this node
             # (detect_stuck_jobs may have reset it while we were offline)
             try:
@@ -511,11 +589,13 @@ def claim_next() -> tuple[str, str] | None:
     try:
         r = httpx.get(f"{PIPELINE_API}/api/upscale/current/{NODE_ID}", timeout=5)
         if r.status_code == 200:
-            item = r.json()
-            input_path = _resolve_claimed_input(item)
-            if input_path:
-                log.info(f"[{item['id']}] Resuming node-owned job without relying on checkpoint discovery")
-                return item["id"], input_path
+            for item in r.json():
+                if item["id"] in active_ids:
+                    continue
+                input_path = _resolve_claimed_input(item)
+                if input_path:
+                    log.info(f"[{item['id']}] Resuming node-owned job without relying on checkpoint discovery")
+                    return item["id"], input_path
     except Exception:
         pass
 
@@ -555,7 +635,7 @@ def main():
                 time.sleep(POLL_INTERVAL); continue
             slots = PARALLEL_JOBS - len(active)
             while slots > 0:
-                result = claim_next()
+                result = claim_next(set(active))
                 if not result:
                     break
                 item_id, input_path = result
